@@ -1,18 +1,22 @@
 import React, { useState, useEffect } from 'react';
 import { db, auth } from '../firebase';
 import { collection, query, getDocs, where, setDoc, doc, serverTimestamp, orderBy, limit, getDoc } from 'firebase/firestore';
-import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { handleFirestoreError, OperationType, fetchStudentsForUser } from '../lib/firestoreUtils';
 import { Student, MilkBrushingRecord, Attendance, UserProfile } from '../types';
 import { Milk, Smile, Save, Calendar, Filter, CheckCircle2, XCircle, Download, FileText, FileSpreadsheet, UserPlus } from 'lucide-react';
 import { format } from 'date-fns';
 import { th } from 'date-fns/locale';
 import { motion, AnimatePresence } from 'framer-motion';
-import { cn, toDate } from '../lib/utils';
-import * as XLSX from 'xlsx';
-import jsPDF from 'jspdf';
+import { cn } from '../lib/utils';
+import toast from 'react-hot-toast';
+import { exportToExcel } from '../lib/excelExport';
+import { useAcademicYear } from '../contexts/AcademicYearContext';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { setupThaiFont } from '../lib/pdfFont';
 
 export default function MilkBrushingSystem() {
+  const { selectedYear, selectedTerm } = useAcademicYear();
   const [students, setStudents] = useState<Student[]>([]);
   const [selectedClass, setSelectedClass] = useState('ป.3/1');
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
@@ -23,6 +27,7 @@ export default function MilkBrushingSystem() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [reportFormat, setReportFormat] = useState<'pdf' | 'excel'>('pdf');
+  const [reportType, setReportType] = useState<'daily' | 'weekly' | 'monthly'>('daily');
 
   useEffect(() => {
     fetchUserProfile();
@@ -47,13 +52,13 @@ export default function MilkBrushingSystem() {
   const fetchStudents = async () => {
     setLoading(true);
     try {
-      const q = query(collection(db, 'students'), where('classId', '==', selectedClass));
-      const querySnapshot = await getDocs(q);
-      const studentList = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Student))
+      const studentList = await fetchStudentsForUser();
+      const filteredList = studentList
+        .filter(s => (s.yearClasses?.[selectedYear] || s.classId) === selectedClass)
         .sort((a, b) => (a.studentNumber || 0) - (b.studentNumber || 0));
-      setStudents(studentList);
+      setStudents(filteredList);
     } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'students');
+      console.error("Error fetching students: ", error);
     } finally {
       setLoading(false);
     }
@@ -64,7 +69,9 @@ export default function MilkBrushingSystem() {
       const q = query(
         collection(db, 'attendance'),
         where('classId', '==', selectedClass),
-        where('date', '==', selectedDate)
+        where('date', '==', selectedDate),
+        where('academicYear', '==', selectedYear),
+        where('term', '==', selectedTerm)
       );
       const querySnapshot = await getDocs(q);
       const data: any = {};
@@ -83,7 +90,9 @@ export default function MilkBrushingSystem() {
       const q = query(
         collection(db, 'milkBrushing'), 
         where('classId', '==', selectedClass),
-        where('date', '==', selectedDate)
+        where('date', '==', selectedDate),
+        where('academicYear', '==', selectedYear),
+        where('term', '==', selectedTerm)
       );
       const querySnapshot = await getDocs(q);
       const data: any = {};
@@ -110,7 +119,7 @@ export default function MilkBrushingSystem() {
     // 1. Identify absentees (absent or leave)
     const absentees = students.filter(s => attendance[s.id] === 'absent' || attendance[s.id] === 'leave');
     if (absentees.length === 0) {
-      alert('ไม่มีนักเรียนขาดเรียนในวันนี้');
+      toast.error('ไม่มีนักเรียนขาดเรียนในวันนี้');
       return;
     }
 
@@ -123,6 +132,7 @@ export default function MilkBrushingSystem() {
         where('type', '==', 'milk'),
         where('isSubstitution', '==', true),
         where('date', '<', selectedDate),
+        where('academicYear', '==', selectedYear),
         orderBy('date', 'desc'),
         orderBy('substitutionIndex', 'desc'),
         limit(1)
@@ -160,7 +170,7 @@ export default function MilkBrushingSystem() {
     });
 
     setRecords(newRecords);
-    alert(`มอบหมายการดื่มนมแทนให้ ${absentees.length} คน เรียบร้อยแล้ว`);
+    toast.success(`มอบหมายการดื่มนมแทนให้ ${absentees.length} คน เรียบร้อยแล้ว`);
   };
 
   const toggleStatus = (studentId: string, type: 'milk' | 'brushing') => {
@@ -188,6 +198,9 @@ export default function MilkBrushingSystem() {
           isSubstitution: record.isSubstitution || false,
           substitutedForId: record.substitutedForId || null,
           substitutionIndex: (record as any).substitutionIndex || null,
+          academicYear: selectedYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
           updatedAt: serverTimestamp()
         });
         
@@ -197,86 +210,167 @@ export default function MilkBrushingSystem() {
           type: 'brushing',
           status: record.brushing,
           classId: selectedClass,
+          academicYear: selectedYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
           updatedAt: serverTimestamp()
         });
       }
-      alert('บันทึกข้อมูลเรียบร้อยแล้ว!');
+      toast.success('บันทึกข้อมูลแล้ว');
     } catch (error) {
       console.error("Error saving records: ", error);
-      alert('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
+      toast.error('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
     } finally {
       setSaving(false);
     }
   };
 
-  const generateReport = () => {
-    const dateStr = format(toDate(selectedDate), 'd MMMM yyyy', { locale: th });
+  const generateReport = async () => {
+    // Calculate date range based on reportType
+    let startDate = new Date(selectedDate);
+    let endDate = new Date(selectedDate);
+    
+    if (reportType === 'weekly') {
+      startDate.setDate(startDate.getDate() - startDate.getDay());
+      endDate.setDate(startDate.getDate() + 6);
+    } else if (reportType === 'monthly') {
+      startDate.setDate(1);
+      endDate.setMonth(endDate.getMonth() + 1, 0);
+    }
+
+    const dateStr = `${format(startDate, 'd MMM', { locale: th })} - ${format(endDate, 'd MMM yyyy', { locale: th })}`;
     const teacherName = userProfile?.displayName || 'ไม่ระบุ';
 
-    const reportData = students.map(s => {
-      const record = records[s.id] || { milk: false, brushing: false };
-      const substitutedFor = record.substitutedForId ? students.find(st => st.id === record.substitutedForId) : null;
+    // Fetch records based on range
+    const q = query(
+      collection(db, 'milkBrushing'), 
+      where('classId', '==', selectedClass),
+      where('date', '>=', format(startDate, 'yyyy-MM-dd')),
+      where('date', '<=', format(endDate, 'yyyy-MM-dd')),
+      where('academicYear', '==', selectedYear),
+      where('term', '==', selectedTerm)
+    );
+    const querySnapshot = await getDocs(q);
+    const fetchedRecords: any = {};
+    const substitutionDetails: any[] = [];
+    students.forEach(s => fetchedRecords[s.id] = { milk: 0, brushing: 0, substitutionCount: 0, substitutedForCount: 0 });
+    
+    querySnapshot.docs.forEach(doc => {
+      const record = doc.data();
+      const studentId = record.studentId;
       
+      if (!fetchedRecords[studentId]) fetchedRecords[studentId] = { milk: 0, brushing: 0, substitutionCount: 0, substitutedForCount: 0 };
+      
+      if (record.type === 'milk' && record.status) {
+        fetchedRecords[studentId].milk++;
+        if (record.isSubstitution) {
+          fetchedRecords[studentId].substitutionCount++;
+          if (record.substitutedForId) {
+            const substitute = students.find(s => s.id === studentId);
+            const substitutedFor = students.find(s => s.id === record.substitutedForId);
+            if (substitute && substitutedFor) {
+              substitutionDetails.push({
+                date: record.date,
+                substitute: `${substitute.firstName} ${substitute.lastName}`,
+                substitutedFor: `${substitutedFor.firstName} ${substitutedFor.lastName}`
+              });
+            }
+          }
+        }
+      }
+      
+      if (record.type === 'milk' && record.isSubstitution && record.substitutedForId) {
+        if (!fetchedRecords[record.substitutedForId]) fetchedRecords[record.substitutedForId] = { milk: 0, brushing: 0, substitutionCount: 0, substitutedForCount: 0 };
+        fetchedRecords[record.substitutedForId].substitutedForCount++;
+      }
+
+      if (record.type === 'brushing' && record.status) fetchedRecords[studentId].brushing++;
+    });
+
+    const reportData = students.map(s => {
+      const record = fetchedRecords[s.id] || { milk: 0, brushing: 0, substitutionCount: 0, substitutedForCount: 0 };
       return {
         'เลขที่': s.studentNumber || '-',
         'รหัสนักเรียน': s.studentId,
-        'ชื่อ-นามสกุล': `${s.firstName} ${s.lastName}`,
-        'การดื่มนม': record.milk ? (record.isSubstitution ? 'ดื่มปกติ + ดื่มแทน' : 'ดื่มปกติ') : 'ไม่ได้ดื่ม',
-        'ดื่มแทนใคร': substitutedFor ? `${substitutedFor.firstName} ${substitutedFor.lastName}` : '-',
-        'การแปรงฟัน': record.brushing ? 'แปรงฟัน' : 'ไม่ได้แปรง'
+        'ชื่อ-นามสกุล': `${s.prefix || ''}${s.firstName} ${s.lastName}`,
+        'การดื่มนม': `${record.milk} ครั้ง`,
+        'ดื่มแทน': `${record.substitutionCount} ครั้ง`,
+        'ถูกดื่มแทน': `${record.substitutedForCount} ครั้ง`,
+        'การแปรงฟัน': `${record.brushing} ครั้ง`
       };
     });
 
     if (reportFormat === 'excel') {
-      const ws = XLSX.utils.json_to_sheet(reportData);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "MilkBrushing");
-      
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`รายงานการดื่มนมและแปรงฟัน ชั้น ${selectedClass}`],
-        [`วันที่: ${dateStr}`],
-        [],
-      ], { origin: "A1" });
+      const headers = ['เลขที่', 'รหัสนักเรียน', 'ชื่อ-นามสกุล', 'การดื่มนม', 'ดื่มแทน', 'ถูกดื่มแทน', 'การแปรงฟัน'];
+      const data = reportData.map(r => [
+        r['เลขที่'],
+        r['รหัสนักเรียน'],
+        r['ชื่อ-นามสกุล'],
+        r['การดื่มนม'],
+        r['ดื่มแทน'],
+        r['ถูกดื่มแทน'],
+        r['การแปรงฟัน']
+      ]);
 
-      const lastRow = reportData.length + 6;
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`ลงชื่อ......................................................`],
-        [`( ${teacherName} )`],
-        [`ตำแหน่ง ครูประจำชั้น`]
-      ], { origin: `D${lastRow}` });
-
-      XLSX.writeFile(wb, `Milk_Brushing_Report_${selectedDate}.xlsx`);
+      await exportToExcel(
+        `รายงานการดื่มนมและแปรงฟัน ชั้น ${selectedClass}`,
+        `ช่วงเวลา: ${dateStr}`,
+        headers,
+        data,
+        `Milk_Brushing_Report_${selectedDate}.xlsx`,
+        [
+          ...substitutionDetails.map(d => `${d.date}: ${d.substitute} ดื่มแทน ${d.substitutedFor}`),
+          `ลงชื่อ......................................................`,
+          `( ${teacherName} )`,
+          `ตำแหน่ง ครูประจำชั้น`
+        ]
+      );
     } else {
       const doc = new jsPDF();
+      await setupThaiFont(doc);
+      
+      doc.setFont('Sarabun', 'bold');
       doc.setFontSize(16);
-      doc.text(`Milk and Brushing Report - Class ${selectedClass}`, 105, 15, { align: 'center' });
+      doc.text(`รายงานการดื่มนมและแปรงฟัน - ชั้น ${selectedClass}`, 105, 15, { align: 'center' });
+      
+      doc.setFont('Sarabun', 'normal');
       doc.setFontSize(12);
-      doc.text(`Date: ${dateStr}`, 105, 25, { align: 'center' });
+      doc.text(`ช่วงเวลา: ${dateStr}`, 105, 25, { align: 'center' });
 
       autoTable(doc, {
         startY: 35,
-        head: [['No.', 'ID', 'Name', 'Milk Status', 'Substitute For', 'Brushing']],
+        head: [['เลขที่', 'รหัส', 'ชื่อ-นามสกุล', 'การดื่มนม', 'ดื่มแทน', 'ถูกดื่มแทน', 'การแปรงฟัน']],
         body: students.map(s => {
-          const record = records[s.id] || { milk: false, brushing: false };
-          const substitutedFor = record.substitutedForId ? students.find(st => st.id === record.substitutedForId) : null;
+          const record = fetchedRecords[s.id] || { milk: 0, brushing: 0, substitutionCount: 0, substitutedForCount: 0 };
           return [
             s.studentNumber || '-',
             s.studentId,
-            `${s.firstName} ${s.lastName}`,
-            record.milk ? (record.isSubstitution ? 'Normal + Sub' : 'Normal') : 'No',
-            substitutedFor ? `${substitutedFor.firstName} ${substitutedFor.lastName}` : '-',
-            record.brushing ? 'Yes' : 'No'
+            `${s.prefix || ''}${s.firstName} ${s.lastName}`,
+            `${record.milk} ครั้ง`,
+            `${record.substitutionCount} ครั้ง`,
+            `${record.substitutedForCount} ครั้ง`,
+            `${record.brushing} ครั้ง`
           ];
         }),
         theme: 'grid',
-        headStyles: { fillColor: [16, 185, 129] }
+        styles: { font: 'Sarabun', fontSize: 12 },
+        headStyles: { fillColor: [16, 185, 129], font: 'Sarabun', fontStyle: 'bold' },
+        bodyStyles: { font: 'Sarabun', fontStyle: 'normal' },
       });
 
-      const finalY = (doc as any).lastAutoTable.finalY + 20;
+      const finalY = (doc as any).lastAutoTable.finalY + 10;
+      doc.setFont('Sarabun', 'bold');
+      doc.text('รายละเอียดการดื่มนมแทน:', 14, finalY);
+      doc.setFont('Sarabun', 'normal');
+      substitutionDetails.forEach((d, i) => {
+        doc.text(`${d.date}: ${d.substitute} ดื่มแทน ${d.substitutedFor}`, 14, finalY + 7 + (i * 7));
+      });
+
+      const signatureY = finalY + 20 + (substitutionDetails.length * 7);
       const rightX = 140;
-      doc.text(`ลงชื่อ......................................................`, rightX, finalY);
-      doc.text(`( ${teacherName} )`, rightX + 10, finalY + 10);
-      doc.text(`ตำแหน่ง ครูประจำชั้น`, rightX + 12, finalY + 17);
+      doc.text(`ลงชื่อ......................................................`, rightX, signatureY);
+      doc.text(`( ${teacherName} )`, rightX + 10, signatureY + 10);
+      doc.text(`ตำแหน่ง ครูประจำชั้น`, rightX + 12, signatureY + 17);
 
       doc.save(`Milk_Brushing_Report_${selectedDate}.pdf`);
     }
@@ -364,11 +458,11 @@ export default function MilkBrushingSystem() {
                     <td className="px-6 py-4 text-sm font-medium text-slate-500">{student.studentNumber || '-'}</td>
                     <td className="px-6 py-4">
                       <div className="flex flex-col">
-                        <span className="text-sm font-bold text-slate-800">{student.firstName} {student.lastName}</span>
+                        <span className="text-sm font-bold text-slate-800">{student.prefix || ''}{student.firstName} {student.lastName}</span>
                         {record.isSubstitution && substitutedFor && (
                           <span className="text-[10px] font-bold text-amber-600 flex items-center gap-1">
                             <UserPlus size={10} />
-                            ดื่มแทน: {substitutedFor.firstName} {substitutedFor.lastName}
+                            ดื่มแทน: {substitutedFor.prefix || ''}{substitutedFor.firstName} {substitutedFor.lastName}
                           </span>
                         )}
                         {isAbsent && (
@@ -438,6 +532,39 @@ export default function MilkBrushingSystem() {
                 </div>
 
                 <div className="space-y-6">
+                  <div className="space-y-3">
+                    <label className="text-sm font-bold text-slate-700 uppercase tracking-wider">รูปแบบรายงาน</label>
+                    <div className="grid grid-cols-3 gap-3">
+                      <button 
+                        onClick={() => setReportType('daily')}
+                        className={cn(
+                          "p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-2",
+                          reportType === 'daily' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 hover:border-slate-200 text-slate-400"
+                        )}
+                      >
+                        <span className="font-bold">รายวัน</span>
+                      </button>
+                      <button 
+                        onClick={() => setReportType('weekly')}
+                        className={cn(
+                          "p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-2",
+                          reportType === 'weekly' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 hover:border-slate-200 text-slate-400"
+                        )}
+                      >
+                        <span className="font-bold">รายสัปดาห์</span>
+                      </button>
+                      <button 
+                        onClick={() => setReportType('monthly')}
+                        className={cn(
+                          "p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-2",
+                          reportType === 'monthly' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 hover:border-slate-200 text-slate-400"
+                        )}
+                      >
+                        <span className="font-bold">รายเดือน</span>
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="space-y-3">
                     <label className="text-sm font-bold text-slate-700 uppercase tracking-wider">นามสกุลไฟล์</label>
                     <div className="grid grid-cols-2 gap-3">

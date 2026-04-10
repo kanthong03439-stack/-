@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebase';
-import { collection, query, getDocs, doc, updateDoc, deleteDoc, where } from 'firebase/firestore';
+import { collection, query, getDocs, doc, updateDoc, deleteDoc, where, onSnapshot } from 'firebase/firestore';
 import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { sendApprovalEmail } from '../services/emailService';
 import { UserProfile } from '../types';
@@ -16,22 +16,17 @@ export default function AdminPanel() {
   const [emailStatus, setEmailStatus] = useState<{ uid: string; status: 'sending' | 'success' | 'error' } | null>(null);
 
   useEffect(() => {
-    fetchUsers();
-  }, []);
-
-  const fetchUsers = async () => {
-    setLoading(true);
-    try {
-      const q = query(collection(db, 'users'));
-      const querySnapshot = await getDocs(q);
-      const userList = querySnapshot.docs.map(doc => ({ ...doc.data() } as UserProfile));
+    const q = query(collection(db, 'users'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const userList = snapshot.docs.map(doc => ({ ...doc.data() } as UserProfile));
       setUsers(userList);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'users');
-    } finally {
       setLoading(false);
-    }
-  };
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'users');
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
   const handleApprove = async (uid: string, status: boolean, userEmail: string, userName: string) => {
     try {
@@ -50,8 +45,6 @@ export default function AdminPanel() {
           setTimeout(() => setEmailStatus(null), 5000);
         }
       }
-      
-      fetchUsers();
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
     }
@@ -59,16 +52,49 @@ export default function AdminPanel() {
 
   const handleDelete = async (uid: string) => {
     try {
+      // 1. Delete user profile from Firestore
       await deleteDoc(doc(db, 'users', uid));
+
+      // 2. Delete user from Firebase Auth via backend API
+      try {
+        const response = await fetch(`/api/users/${uid}`, {
+          method: 'DELETE',
+        });
+        if (!response.ok) {
+          console.warn('Failed to delete user from Firebase Auth. They may need to be deleted manually.');
+        }
+      } catch (apiErr) {
+        console.error('API error when deleting user:', apiErr);
+      }
+
+      // 3. Deep delete teacher data
+      const collectionsToClean = [
+        { name: 'teacher_links', field: 'userId' },
+        { name: 'calendar_events', field: 'userId' },
+        { name: 'attendance', field: 'teacherId' },
+        { name: 'milkBrushing', field: 'teacherId' },
+        { name: 'healthRecords', field: 'teacherId' },
+        { name: 'savings', field: 'teacherId' },
+        { name: 'grades', field: 'teacherId' },
+        { name: 'students', field: 'teacherId' },
+        { name: 'subjects', field: 'teacherId' }
+      ];
+
+      for (const col of collectionsToClean) {
+        const q = query(collection(db, col.name), where(col.field, '==', uid));
+        const snapshot = await getDocs(q);
+        const deletePromises = snapshot.docs.map(d => deleteDoc(doc(db, col.name, d.id)));
+        await Promise.all(deletePromises);
+      }
+
       setConfirmDelete(null);
-      fetchUsers();
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, `users/${uid}`);
     }
   };
 
   const filteredUsers = users.filter(u => 
-    `${u.displayName} ${u.email}`.toLowerCase().includes(searchTerm.toLowerCase())
+    `${u.displayName} ${u.email} ${u.studentId || ''}`.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
   return (
@@ -78,7 +104,7 @@ export default function AdminPanel() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
           <input 
             type="text"
-            placeholder="ค้นหาชื่อ หรืออีเมลผู้ใช้งาน..."
+            placeholder="ค้นหาชื่อ, อีเมล หรือเลขประจำตัว..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 transition-all shadow-sm"
@@ -87,9 +113,17 @@ export default function AdminPanel() {
       </div>
 
       <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
-        <div className="p-4 border-b border-slate-100 bg-slate-50 flex items-center gap-2">
-          <Shield size={20} className="text-blue-600" />
-          <h3 className="font-bold text-slate-800">จัดการผู้ใช้งานและสิทธิ์การเข้าถึง</h3>
+        <div className="p-4 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Shield size={20} className="text-blue-600" />
+            <h3 className="font-bold text-slate-800">จัดการผู้ใช้งานและสิทธิ์การเข้าถึง</h3>
+          </div>
+          {users.filter(u => !u.isApproved).length > 0 && (
+            <div className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1.5 border border-amber-200">
+              <AlertTriangle size={14} />
+              รอการอนุมัติ {users.filter(u => !u.isApproved).length} คน
+            </div>
+          )}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
@@ -111,16 +145,20 @@ export default function AdminPanel() {
                   <td className="px-6 py-4">
                     <div className="flex flex-col">
                       <span className="text-sm font-bold text-slate-800">{user.displayName}</span>
-                      <span className="text-xs text-slate-400">{user.email}</span>
+                      {user.role === 'student' ? (
+                        <span className="text-xs text-blue-600 font-medium">ID: {user.studentId}</span>
+                      ) : (
+                        <span className="text-xs text-slate-400">{user.email}</span>
+                      )}
                     </div>
                   </td>
                   <td className="px-6 py-4">
                     <span className={cn(
                       "px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase",
                       user.role === 'admin' ? "bg-purple-50 text-purple-600" :
-                      user.role === 'teacher' ? "bg-blue-50 text-blue-600" : "bg-slate-50 text-slate-600"
+                      user.role === 'teacher' ? "bg-blue-50 text-blue-600" : "bg-orange-50 text-orange-600"
                     )}>
-                      {user.role}
+                      {user.role === 'student' ? 'นักเรียน' : user.role === 'teacher' ? 'ครู' : 'ผู้ดูแล'}
                     </span>
                   </td>
                   <td className="px-6 py-4">
@@ -150,7 +188,7 @@ export default function AdminPanel() {
                             >
                               {user.isApproved ? 'ยกเลิกอนุมัติ' : 'อนุมัติการใช้งาน'}
                             </button>
-                            {emailStatus?.uid === user.uid && (
+                            {emailStatus?.uid === user.uid && user.role !== 'student' && (
                               <span className={cn(
                                 "text-[10px] font-medium flex items-center gap-1",
                                 emailStatus.status === 'sending' ? "text-blue-500" :
@@ -195,7 +233,7 @@ export default function AdminPanel() {
               <div className="space-y-2">
                 <h3 className="text-xl font-bold text-slate-800">ยืนยันการลบผู้ใช้งาน</h3>
                 <p className="text-slate-500 text-sm">
-                  คุณแน่ใจหรือไม่ว่าต้องการลบผู้ใช้งานนี้? การดำเนินการนี้ไม่สามารถย้อนกลับได้
+                  คุณแน่ใจหรือไม่ว่าต้องการลบผู้ใช้งานนี้? ผู้ใช้จะถูกบังคับออกจากระบบและต้องลงทะเบียนใหม่เพื่อขออนุมัติอีกครั้ง
                 </p>
               </div>
               <div className="flex gap-3">

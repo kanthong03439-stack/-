@@ -10,6 +10,7 @@
         "displayName": { "type": "string" },
         "role": { "type": "string", "enum": ["admin", "teacher", "student"] },
         "isApproved": { "type": "boolean" },
+        "studentId": { "type": "string" },
         "classId": { "type": "string" },
         "createdAt": { "type": "string", "format": "date-time" }
       },
@@ -96,15 +97,88 @@
         "classId": { "type": "string" }
       },
       "required": ["name", "code", "teacherId", "classId"]
+    },
+    "TeacherDocument": {
+      "title": "Teacher Document",
+      "description": "Documents, works, and awards of the teacher",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "organization": { "type": "string" },
+        "dateReceived": { "type": "string" },
+        "description": { "type": "string" },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "url": { "type": "string" },
+              "type": { "type": "string", "enum": ["image", "file", "link"] }
+            }
+          }
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "dateReceived"]
+    },
+    "TeacherLink": {
+      "title": "Teacher Link",
+      "description": "Essential website links for teachers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "url": { "type": "string" },
+        "description": { "type": "string" },
+        "category": { "type": "string" },
+        "userId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "url", "userId", "createdAt"]
+    },
+    "CalendarEvent": {
+      "title": "Calendar Event",
+      "description": "Work calendar events for teachers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" },
+        "allDay": { "type": "boolean" },
+        "description": { "type": "string" },
+        "category": { "type": "string" },
+        "color": { "type": "string" },
+        "userId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "start", "allDay", "userId", "createdAt"]
+    },
+    "StudentMaster": {
+      "title": "Student Master",
+      "description": "Master data for student validation during registration",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string" },
+        "fullName": { "type": "string" }
+      },
+      "required": ["studentId", "fullName"]
     }
   },
   "firestore": {
     "/users/{uid}": { "schema": "User", "description": "User profiles" },
+    "/students_master/{id}": { "schema": "StudentMaster", "description": "Master data for student validation" },
     "/students/{studentId}": { "schema": "Student", "description": "Student records" },
     "/attendance/{attendanceId}": { "schema": "Attendance", "description": "Attendance records" },
     "/grades/{gradeId}": { "schema": "Grade", "description": "Grade records" },
     "/milkBrushing/{recordId}": { "schema": "MilkBrushing", "description": "Milk and brushing records" },
     "/savings/{savingId}": { "schema": "Savings", "description": "Savings records" },
-    "/subjects/{subjectId}": { "schema": "Subject", "description": "Teaching subject records" }
+    "/subjects/{subjectId}": { "schema": "Subject", "description": "Teaching subject records" },
+    "/teacher_documents/{documentId}": { "schema": "TeacherDocument", "description": "Teacher documents and awards" },
+    "/teacher_links/{linkId}": { "schema": "TeacherLink", "description": "Teacher essential links" },
+    "/calendar_events/{eventId}": { "schema": "CalendarEvent", "description": "Teacher work calendar events" }
   }
 }

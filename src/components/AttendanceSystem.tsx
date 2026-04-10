@@ -1,18 +1,23 @@
 import React, { useState, useEffect } from 'react';
 import { db, auth } from '../firebase';
-import { collection, query, getDocs, where, addDoc, serverTimestamp, setDoc, doc, getDoc } from 'firebase/firestore';
-import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
+import { collection, query, getDocs, where, addDoc, serverTimestamp, setDoc, doc, getDoc, writeBatch } from 'firebase/firestore';
+import { handleFirestoreError, OperationType, fetchStudentsForUser } from '../lib/firestoreUtils';
 import { Student, Attendance, Subject, UserProfile } from '../types';
-import { Calendar, Check, X, Clock, AlertCircle, Save, Filter, Milk, Smile, Download, FileText, FileSpreadsheet, XCircle, BookOpen } from 'lucide-react';
+import { Calendar, Check, X, Clock, AlertCircle, Save, Filter, Milk, Smile, Download, FileText, FileSpreadsheet, XCircle, BookOpen, Search } from 'lucide-react';
 import { format } from 'date-fns';
 import { th } from 'date-fns/locale';
 import { motion, AnimatePresence } from 'framer-motion';
-import { cn, toDate } from '../lib/utils';
-import * as XLSX from 'xlsx';
-import jsPDF from 'jspdf';
+import { cn } from '../lib/utils';
+import toast from 'react-hot-toast';
+import { exportToExcel } from '../lib/excelExport';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
+import { setupThaiFont } from '../lib/pdfFont';
+import { useAcademicYear } from '../contexts/AcademicYearContext';
+
 export default function AttendanceSystem() {
+  const { selectedYear, selectedTerm } = useAcademicYear();
   const [students, setStudents] = useState<Student[]>([]);
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [selectedClassLevel, setSelectedClassLevel] = useState<string>('ทั้งหมด');
@@ -21,6 +26,7 @@ export default function AttendanceSystem() {
   const [selectedPeriod, setSelectedPeriod] = useState<number>(1);
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [attendance, setAttendance] = useState<Record<string, 'present' | 'absent' | 'late' | 'leave'>>({});
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -61,13 +67,20 @@ export default function AttendanceSystem() {
     try {
       const user = auth.currentUser;
       if (!user) return;
-      const q = query(collection(db, 'subjects'), where('teacherId', '==', user.uid));
+      const q = query(
+        collection(db, 'subjects'), 
+        where('teacherId', '==', user.uid),
+        where('academicYear', '==', selectedYear)
+      );
       const querySnapshot = await getDocs(q);
       const subjectList = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Subject));
       setSubjects(subjectList);
       if (subjectList.length > 0) {
         setSelectedSubject(subjectList[0].id);
         setSelectedClass(subjectList[0].classId);
+      } else {
+        setSelectedSubject('');
+        setSelectedClass('');
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.LIST, 'subjects');
@@ -75,15 +88,16 @@ export default function AttendanceSystem() {
   };
 
   const fetchStudents = async () => {
+    if (!selectedClass) return;
     setLoading(true);
     try {
-      const q = query(collection(db, 'students'), where('classId', '==', selectedClass));
-      const querySnapshot = await getDocs(q);
-      const studentList = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Student))
+      const studentList = await fetchStudentsForUser();
+      const filteredList = studentList
+        .filter(s => (s.yearClasses?.[selectedYear] || s.classId) === selectedClass)
         .sort((a, b) => (a.studentNumber || 0) - (b.studentNumber || 0));
-      setStudents(studentList);
+      setStudents(filteredList);
     } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'students');
+      console.error(error);
     } finally {
       setLoading(false);
     }
@@ -97,7 +111,9 @@ export default function AttendanceSystem() {
         where('classId', '==', selectedClass),
         where('date', '==', selectedDate),
         where('subjectId', '==', selectedSubject),
-        where('period', '==', selectedPeriod)
+        where('period', '==', selectedPeriod),
+        where('academicYear', '==', selectedYear),
+        where('term', '==', selectedTerm)
       );
       const querySnapshot = await getDocs(q);
       const records: any = {};
@@ -115,9 +131,55 @@ export default function AttendanceSystem() {
     setAttendance(prev => ({ ...prev, [studentId]: status }));
   };
 
+  const clearAttendance = async () => {
+    console.log("Clear attendance button clicked.");
+    // if (!confirm(`คุณต้องการล้างข้อมูลการเช็คชื่อของวันที่ ${selectedDate} สำหรับวิชานี้ใช่หรือไม่?`)) return;
+    
+    setSaving(true);
+    try {
+      // 1. Delete attendance records
+      const q = query(
+        collection(db, 'attendance'), 
+        where('classId', '==', selectedClass),
+        where('date', '==', selectedDate),
+        where('subjectId', '==', selectedSubject),
+        where('period', '==', selectedPeriod),
+        where('academicYear', '==', selectedYear),
+        where('term', '==', selectedTerm)
+      );
+      const querySnapshot = await getDocs(q);
+      console.log(`Found ${querySnapshot.size} attendance records to delete.`);
+      const batch = writeBatch(db);
+      querySnapshot.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+
+      // 2. Clear milk/brushing records for this date and class
+      const qMilk = query(
+        collection(db, 'milkBrushing'),
+        where('classId', '==', selectedClass),
+        where('date', '==', selectedDate),
+        where('academicYear', '==', selectedYear),
+        where('term', '==', selectedTerm)
+      );
+      const milkSnapshot = await getDocs(qMilk);
+      console.log(`Found ${milkSnapshot.size} milk/brushing records to delete.`);
+      const milkBatch = writeBatch(db);
+      milkSnapshot.docs.forEach(doc => milkBatch.delete(doc.ref));
+      await milkBatch.commit();
+
+      setAttendance({});
+      toast.success('ล้างข้อมูลเรียบร้อยแล้ว!');
+    } catch (error) {
+      console.error("Error clearing attendance: ", error);
+      toast.error('เกิดข้อผิดพลาดในการล้างข้อมูล');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const saveAttendance = async () => {
     if (!selectedSubject) {
-      alert('กรุณาเลือกรายวิชา');
+      toast.error('กรุณาเลือกรายวิชา');
       return;
     }
     setSaving(true);
@@ -133,108 +195,135 @@ export default function AttendanceSystem() {
           classId: selectedClass,
           subjectId: selectedSubject,
           period: selectedPeriod,
+          academicYear: selectedYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
           updatedAt: serverTimestamp()
         });
 
-        // Auto-link for Grade 3 to Milk and Brushing (only for period 1 usually)
-        if (selectedClass.startsWith('ป.3') && status === 'present' && selectedPeriod === 1) {
-          await setDoc(doc(db, 'milkBrushing', `${selectedDate}_${studentId}_milk`), {
-            date: selectedDate,
-            studentId,
-            type: 'milk',
-            status: true,
-            classId: selectedClass
-          });
-          await setDoc(doc(db, 'milkBrushing', `${selectedDate}_${studentId}_brushing`), {
-            date: selectedDate,
-            studentId,
-            type: 'brushing',
-            status: true,
-            classId: selectedClass
-          });
-        }
+        // Auto-link for all classes to Milk and Brushing
+        await setDoc(doc(db, 'milkBrushing', `${selectedDate}_${studentId}_milk`), {
+          date: selectedDate,
+          studentId,
+          type: 'milk',
+          status: status === 'present',
+          classId: selectedClass,
+          academicYear: selectedYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
+          updatedAt: serverTimestamp()
+        });
+        await setDoc(doc(db, 'milkBrushing', `${selectedDate}_${studentId}_brushing`), {
+          date: selectedDate,
+          studentId,
+          type: 'brushing',
+          status: status === 'present',
+          classId: selectedClass,
+          academicYear: selectedYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
+          updatedAt: serverTimestamp()
+        });
       }
-      alert('บันทึกข้อมูลเรียบร้อยแล้ว!');
+      toast.success('บันทึกข้อมูลแล้ว');
     } catch (error) {
       console.error("Error saving attendance: ", error);
-      alert('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
+      toast.error('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
     } finally {
       setSaving(false);
     }
   };
 
-  const generateReport = () => {
+  const generateReport = async () => {
     const subject = subjects.find(s => s.id === selectedSubject);
     const subjectName = subject?.name || 'ไม่ระบุ';
     const teacherName = userProfile?.displayName || 'ไม่ระบุ';
-    const dateStr = format(toDate(selectedDate), 'd MMMM yyyy', { locale: th });
     
-    const reportData = students.map(s => ({
-      'เลขที่': s.studentNumber || '-',
-      'รหัสนักเรียน': s.studentId,
-      'ชื่อ-นามสกุล': `${s.firstName} ${s.lastName}`,
-      'สถานะ': attendance[s.id] === 'present' ? 'มา' : 
-               attendance[s.id] === 'absent' ? 'ขาด' :
-               attendance[s.id] === 'late' ? 'สาย' :
-               attendance[s.id] === 'leave' ? 'ลา' : '-'
-    }));
+    // Fetch all attendance records for this subject/class
+    const q = query(
+      collection(db, 'attendance'), 
+      where('classId', '==', selectedClass),
+      where('subjectId', '==', selectedSubject),
+      where('academicYear', '==', selectedYear),
+      where('term', '==', selectedTerm)
+    );
+    const querySnapshot = await getDocs(q);
+    const allRecords: any = {};
+    querySnapshot.docs.forEach(doc => {
+      const data = doc.data();
+      if (!allRecords[data.date]) allRecords[data.date] = {};
+      allRecords[data.date][data.studentId] = data.status;
+    });
 
+    const dates = Object.keys(allRecords).sort();
+    
     if (reportFormat === 'excel') {
-      const ws = XLSX.utils.json_to_sheet(reportData);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Attendance");
-      
-      // Add info rows
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`รายงานการเช็คชื่อ/เวลาเรียน (${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'})`],
-        [`วิชา: ${subjectName} ชั้น: ${selectedClass} คาบที่: ${selectedPeriod} วันที่: ${dateStr}`],
-        [],
-        ['เลขที่', 'รหัสนักเรียน', 'ชื่อ-นามสกุล', 'สถานะ']
-      ], { origin: "A1" });
+      const headers = ['เลขที่', 'รหัสนักเรียน', 'ชื่อ-นามสกุล', ...dates];
+      const data = students.map(s => [
+        s.studentNumber || '-',
+        s.studentId,
+        `${s.prefix || ''}${s.firstName} ${s.lastName}`,
+        ...dates.map(date => {
+          const status = allRecords[date][s.id];
+          return status === 'present' ? 'มา' : 
+                 status === 'absent' ? 'ขาด' :
+                 status === 'late' ? 'สาย' :
+                 status === 'leave' ? 'ลา' : '-';
+        })
+      ]);
 
-      // Add signature line to the right (Column C/D)
-      const lastRow = reportData.length + 6;
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`ลงชื่อ......................................................`],
-        [`( ${reportTeacherName} )`],
-        [`ตำแหน่ง ${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'}`]
-      ], { origin: `C${lastRow}` });
-
-      XLSX.writeFile(wb, `Attendance_Report_${selectedDate}.xlsx`);
+      await exportToExcel(
+        `รายงานการเช็คชื่อ/เวลาเรียนทั้งหมด (${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'})`,
+        `วิชา: ${subjectName} | ชั้น: ${selectedClass}`,
+        headers,
+        data,
+        `Attendance_Report_All.xlsx`,
+        [
+          `ลงชื่อ......................................................`,
+          `( ${reportTeacherName} )`,
+          `ตำแหน่ง ${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'}`
+        ]
+      );
     } else {
       const doc = new jsPDF();
+      await setupThaiFont(doc);
       
-      // Add Thai font support would be ideal, but for now we use standard
+      doc.setFont('Sarabun', 'bold');
       doc.setFontSize(16);
-      doc.text(`Attendance Report (${reportType === 'class' ? 'Class Teacher' : 'Subject Teacher'})`, 105, 15, { align: 'center' });
+      doc.text(`รายงานการเช็คชื่อ/เวลาเรียนทั้งหมด (${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'})`, 105, 15, { align: 'center' });
       
+      doc.setFont('Sarabun', 'normal');
       doc.setFontSize(12);
-      doc.text(`Subject: ${subjectName} | Class: ${selectedClass} | Period: ${selectedPeriod}`, 105, 25, { align: 'center' });
-      doc.text(`Date: ${dateStr}`, 105, 32, { align: 'center' });
+      doc.text(`วิชา: ${subjectName} | ชั้น: ${selectedClass}`, 105, 25, { align: 'center' });
 
       autoTable(doc, {
         startY: 40,
-        head: [['No.', 'ID', 'Name', 'Status']],
+        head: [['เลขที่', 'รหัสนักเรียน', 'ชื่อ-นามสกุล', ...dates]],
         body: students.map(s => [
           s.studentNumber || '-',
           s.studentId,
-          `${s.firstName} ${s.lastName}`,
-          attendance[s.id] === 'present' ? 'Present' : 
-          attendance[s.id] === 'absent' ? 'Absent' :
-          attendance[s.id] === 'late' ? 'Late' :
-          attendance[s.id] === 'leave' ? 'Leave' : '-'
+          `${s.prefix || ''}${s.firstName} ${s.lastName}`,
+          ...dates.map(date => {
+            const status = allRecords[date][s.id];
+            return status === 'present' ? 'มา' : 
+                   status === 'absent' ? 'ขาด' :
+                   status === 'late' ? 'สาย' :
+                   status === 'leave' ? 'ลา' : '-';
+          })
         ]),
         theme: 'grid',
-        headStyles: { fillColor: [37, 99, 235] }
+        styles: { font: 'Sarabun', fontSize: 12 },
+        headStyles: { fillColor: [37, 99, 235], font: 'Sarabun', fontStyle: 'bold' },
+        bodyStyles: { font: 'Sarabun', fontStyle: 'normal' },
       });
 
       const finalY = (doc as any).lastAutoTable.finalY + 20;
-      const rightX = 140; // Position for right side signature
+      const rightX = 140;
       doc.text(`ลงชื่อ......................................................`, rightX, finalY);
       doc.text(`( ${reportTeacherName} )`, rightX + 10, finalY + 10);
       doc.text(`ตำแหน่ง ${reportType === 'class' ? 'ครูประจำชั้น' : 'ครูประจำรายวิชา'}`, rightX + 12, finalY + 17);
 
-      doc.save(`Attendance_Report_${selectedDate}.pdf`);
+      doc.save(`Attendance_Report_All.pdf`);
     }
     setIsReportModalOpen(false);
   };
@@ -330,6 +419,14 @@ export default function AttendanceSystem() {
             {saving ? 'บันทึก...' : 'บันทึก'}
           </button>
           <button 
+            onClick={clearAttendance}
+            disabled={saving || !selectedSubject}
+            className="px-4 py-2.5 bg-red-50 text-red-600 rounded-xl font-bold hover:bg-red-100 transition-all shadow-sm flex items-center justify-center gap-2 disabled:opacity-50"
+          >
+            <XCircle size={18} />
+            ล้างข้อมูล
+          </button>
+          <button 
             onClick={() => setIsReportModalOpen(true)}
             className="px-4 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl font-bold hover:bg-slate-50 transition-all shadow-sm flex items-center justify-center gap-2"
           >
@@ -361,6 +458,18 @@ export default function AttendanceSystem() {
 
       {/* Attendance Table */}
       <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
+        <div className="p-4 border-b border-slate-100">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+            <input 
+              type="text"
+              placeholder="ค้นหารายชื่อนักเรียน..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium"
+            />
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
@@ -368,21 +477,32 @@ export default function AttendanceSystem() {
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase w-20">เลขที่</th>
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">รหัส</th>
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">ชื่อ-นามสกุล</th>
-                <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase text-center">สถานะการมาเรียน</th>
+                <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase text-center">
+                  สถานะการมาเรียน
+                  <button 
+                    onClick={() => {
+                      const allPresent = students.reduce((acc, s) => ({ ...acc, [s.id]: 'present' }), {});
+                      setAttendance(allPresent);
+                    }}
+                    className="block w-full mt-2 text-[10px] bg-blue-100 text-blue-700 hover:bg-blue-200 py-1 px-2 rounded-lg transition-all"
+                  >
+                    มาเรียนทั้งหมด
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-50">
               {loading ? (
                 <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-400">กำลังโหลด...</td></tr>
-              ) : students.length === 0 ? (
-                <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-400">ไม่พบรายชื่อนักเรียนในชั้นนี้</td></tr>
-              ) : students.map((student) => (
+              ) : students.filter(s => `${s.firstName} ${s.lastName} ${s.studentId}`.toLowerCase().includes(searchQuery.toLowerCase())).length === 0 ? (
+                <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-400">ไม่พบรายชื่อนักเรียนที่ค้นหา</td></tr>
+              ) : students.filter(s => `${s.firstName} ${s.lastName} ${s.studentId}`.toLowerCase().includes(searchQuery.toLowerCase())).map((student) => (
                 <tr key={student.id} className="hover:bg-slate-50 transition-all">
                   <td className="px-6 py-4 text-sm font-bold text-slate-400">{student.studentNumber || '-'}</td>
                   <td className="px-6 py-4 text-sm font-medium text-slate-500">{student.studentId}</td>
                   <td className="px-6 py-4">
                     <div className="flex items-center gap-3">
-                      <span className="text-sm font-bold text-slate-800">{student.firstName} {student.lastName}</span>
+                      <span className="text-sm font-bold text-slate-800">{student.prefix || ''}{student.firstName} {student.lastName}</span>
                       {selectedClass.startsWith('ป.3') && selectedPeriod === 1 && (
                         <div className="flex gap-1">
                           <Milk size={14} className="text-blue-400" />

@@ -37,13 +37,29 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function getStudentId() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.studentId;
+    }
+
+    function isStudent() {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'student';
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
 
+    match /students_master/{id} {
+      // Allow anyone to check if they are in the master list during registration
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
     match /users/{uid} {
       allow get: if isAuthenticated() && (isOwner(uid) || isAdmin());
-      allow list: if isAdmin();
+      allow list: if isAuthenticated() && (isOwner(uid) || isAdmin());
       allow create: if isAuthenticated() && isOwner(uid);
       allow update: if isAuthenticated() && (
         (isOwner(uid) && request.resource.data.role == resource.data.role) || 
@@ -53,45 +69,71 @@ service cloud.firestore {
     }
 
     match /students/{studentId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if true;
       allow create: if isAuthenticated() && (isAdmin() || isApproved());
       allow update: if isAuthenticated() && (isAdmin() || isApproved());
       allow delete: if isAdmin();
     }
 
     match /attendance/{attendanceId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /grades/{gradeId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /milkBrushing/{recordId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /savings/{recordId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
+      allow write: if isAuthenticated() && (isAdmin() || isApproved());
+    }
+
+    match /healthRecords/{recordId} {
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /health/{recordId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /homeVisits/{recordId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || (isStudent() && resource.data.studentId == getStudentId()));
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
     }
 
     match /subjects/{subjectId} {
-      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow read: if isAuthenticated() && (isAdmin() || isApproved() || isStudent());
       allow write: if isAuthenticated() && (isAdmin() || isApproved());
+    }
+
+    match /teacher_documents/{documentId} {
+      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow create: if isAuthenticated() && isApproved() && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow delete: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid;
+    }
+
+    match /teacher_links/{linkId} {
+      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow create: if isAuthenticated() && isApproved() && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow delete: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid;
+    }
+
+    match /calendar_events/{eventId} {
+      allow read: if isAuthenticated() && (isAdmin() || isApproved());
+      allow create: if isAuthenticated() && isApproved() && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow delete: if isAuthenticated() && isApproved() && resource.data.userId == request.auth.uid;
     }
   }
 }

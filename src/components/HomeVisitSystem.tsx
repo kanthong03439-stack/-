@@ -1,21 +1,19 @@
-/* @jsxRuntime classic */
 import React, { useState, useEffect, useRef } from 'react';
 import { db, auth } from '../firebase';
 import { collection, query, getDocs, addDoc, serverTimestamp, orderBy, doc, getDoc, updateDoc } from 'firebase/firestore';
-import { handleFirestoreError, OperationType } from '../lib/firestoreUtils';
 import { Student, UserProfile } from '../types';
 import { Home, Plus, Calendar, Search, User, Download, FileText, FileCode, ChevronRight, ChevronLeft, Save, Trash2, Camera, MapPin, Clock, Info, Smile, TrendingUp, History as LucideHistory } from 'lucide-react';
 import { format } from 'date-fns';
 import { th } from 'date-fns/locale';
 import { motion, AnimatePresence } from 'framer-motion';
 import SignatureCanvas from 'react-signature-canvas';
-import { cn, toDate } from '../lib/utils';
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
-import html2canvas from 'html2canvas';
-import { Document, Packer, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell, WidthType, ImageRun, PageBreak } from 'docx';
+import { cn } from '../lib/utils';
+import { jsPDF } from 'jspdf';
+import { toJpeg } from 'html-to-image';
+import { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType, HeadingLevel, ImageRun } from 'docx';
 import { saveAs } from 'file-saver';
-import { createHeaderParagraph, createInfoParagraph } from '../lib/docxGenerator';
+import { setupThaiFont } from '../lib/pdfFont';
+import toast from 'react-hot-toast';
 
 interface HouseholdMember {
   id: string;
@@ -281,6 +279,8 @@ const initialFormState: HomeVisitData = {
   }
 };
 
+import { fetchStudentsForUser } from '../lib/firestoreUtils';
+
 export default function HomeVisitSystem() {
   const [students, setStudents] = useState<Student[]>([]);
   const [selectedStudentId, setSelectedStudentId] = useState('');
@@ -294,14 +294,6 @@ export default function HomeVisitSystem() {
 
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
   const [pdfVisitData, setPdfVisitData] = useState<any>(null);
-  const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info', message: string } | null>(null);
-
-  useEffect(() => {
-    if (notification) {
-      const timer = setTimeout(() => setNotification(null), 5000);
-      return () => clearTimeout(timer);
-    }
-  }, [notification]);
 
   useEffect(() => {
     fetchStudents();
@@ -309,175 +301,69 @@ export default function HomeVisitSystem() {
     fetchUserProfile();
   }, []);
 
-  const formatThaiDate = (dateVal: any) => {
-    if (!dateVal) return '';
+  const formatThaiDate = (dateStr: string) => {
+    if (!dateStr) return '';
     try {
-      const date = toDate(dateVal);
+      const date = new Date(dateStr);
       const day = date.getDate();
       const month = format(date, 'MMMM', { locale: th });
       const year = date.getFullYear() + 543;
       return `${day} ${month} พ.ศ. ${year}`;
     } catch (e) {
-      return String(dateVal);
+      return dateStr;
     }
-  };
-
-  const fetchStudents = async () => {
-    try {
-      const q = query(collection(db, 'students'), orderBy('studentId'));
-      const snapshot = await getDocs(q);
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Student));
-      setStudents(data);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'students');
-    }
-  };
-
-  const fetchVisits = async () => {
-    try {
-      const q = query(collection(db, 'homeVisits'), orderBy('date', 'desc'));
-      const snapshot = await getDocs(q);
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setVisits(data);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'homeVisits');
-    }
-  };
-
-  const fetchUserProfile = async () => {
-    if (!auth.currentUser) return;
-    try {
-      const docRef = doc(db, 'users', auth.currentUser.uid);
-      const docSnap = await getDoc(docRef);
-      if (docSnap.exists()) {
-        setUserProfile(docSnap.data() as UserProfile);
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `users/${auth.currentUser.uid}`);
-    }
-  };
-
-  const handleSave = async () => {
-    if (!selectedStudentId) {
-      setNotification({ type: 'error', message: 'กรุณาเลือกนักเรียน' });
-      return;
-    }
-    setLoading(true);
-    try {
-      const visitData = {
-        ...formData,
-        studentId: selectedStudentId,
-        teacherId: auth.currentUser?.uid,
-        teacherName: userProfile ? `${userProfile.firstName} ${userProfile.lastName}` : 'ไม่ระบุ',
-        date: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      await addDoc(collection(db, 'homeVisits'), visitData);
-      setNotification({ type: 'success', message: 'บันทึกข้อมูลสำเร็จ' });
-      fetchVisits();
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'homeVisits');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, field: keyof HomeVisitData['photos']) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const base64 = event.target?.result as string;
-      setFormData(prev => ({
-        ...prev,
-        photos: { ...prev.photos, [field]: base64 }
-      }));
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const updateMember = (id: string, field: string, value: any) => {
-    setFormData(prev => ({
-      ...prev,
-      householdMembers: prev.householdMembers.map(m => 
-        m.id === id ? { ...m, [field]: value } : m
-      )
-    }));
-  };
-
-  const toggleBehaviorRisk = (category: keyof HomeVisitData['behaviorRisks'], value: string) => {
-    setFormData(prev => {
-      const current = (prev.behaviorRisks[category] as string[]) || [];
-      const updated = current.includes(value) 
-        ? current.filter(v => v !== value) 
-        : [...current, value];
-      return {
-        ...prev,
-        behaviorRisks: { ...prev.behaviorRisks, [category]: updated }
-      };
-    });
-  };
-
-  const downloadWord = async (visit: any) => {
-    try {
-      await exportToWord(visit);
-      setNotification({ type: 'success', message: 'สร้างไฟล์ Word สำเร็จ' });
-    } catch (error) {
-      console.error('Error exporting to Word:', error);
-      setNotification({ type: 'error', message: 'เกิดข้อผิดพลาดในการสร้างไฟล์ Word' });
-    }
-  };
-
-  const downloadPDF = async (visit: any) => {
-    setPdfVisitData(visit);
-    setIsGeneratingPDF(true);
-    
-    // Wait for the hidden container to render
-    setTimeout(async () => {
-      if (!pdfContainerRef.current) return;
-      
-      try {
-        const pdf = new jsPDF('p', 'mm', 'a4');
-        const pages = pdfContainerRef.current.children;
-        
-        for (let i = 0; i < pages.length; i++) {
-          const canvas = await html2canvas(pages[i] as HTMLElement, {
-            scale: 2,
-            useCORS: true,
-            logging: false
-          });
-          const imgData = canvas.toDataURL('image/jpeg', 1.0);
-          if (i > 0) pdf.addPage();
-          pdf.addImage(imgData, 'JPEG', 0, 0, 210, 297);
-        }
-        
-        const student = students.find(s => s.id === visit.studentId);
-        pdf.save(`Home_Visit_${student?.firstName || 'Report'}.pdf`);
-        setNotification({ type: 'success', message: 'สร้างไฟล์ PDF สำเร็จ' });
-      } catch (error) {
-        console.error('Error generating PDF:', error);
-        setNotification({ type: 'error', message: 'เกิดข้อผิดพลาดในการสร้าง PDF' });
-      } finally {
-        setIsGeneratingPDF(false);
-        setPdfVisitData(null);
-      }
-    }, 500);
   };
 
   const renderPage1 = (data: HomeVisitData, isPDF = false) => {
     const student = students.find(s => s.id === selectedStudentId);
     
-    const renderIdCardBoxes = (idCard: string = '') => {
+    const renderIdCardBoxes = (idCard: string = '', field: 'studentIdCard' | 'parentIdCard') => {
       const chars = idCard.replace(/-/g, '').padEnd(13, ' ').split('');
+      
+      const handleChange = (index: number, value: string) => {
+        if (isPDF) return;
+        // Only allow numbers
+        if (value && !/^\d$/.test(value)) return;
+        
+        const currentDigits = idCard.replace(/-/g, '').padEnd(13, ' ').split('');
+        currentDigits[index] = value || ' ';
+        const newIdCard = currentDigits.join('').trim();
+        
+        setFormData(prev => ({ ...prev, [field]: newIdCard }));
+        
+        // Auto focus next input
+        if (value && index < 12) {
+          const nextInput = document.getElementById(`id-box-${field}-${index + 1}`);
+          (nextInput as HTMLInputElement)?.focus();
+        }
+      };
+
+      const handleKeyDown = (index: number, e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (isPDF) return;
+        if (e.key === 'Backspace' && !chars[index].trim() && index > 0) {
+          const prevInput = document.getElementById(`id-box-${field}-${index - 1}`);
+          (prevInput as HTMLInputElement)?.focus();
+        }
+      };
+
       return (
         <div className="flex gap-1">
           {chars.map((char, i) => (
-            <div key={i} className={cn(
-              "w-5 h-6 border border-slate-400 flex items-center justify-center font-bold text-blue-800 bg-white",
-              (i === 0 || i === 4 || i === 9 || i === 11) && "mr-1"
-            )}>
-              {char}
-            </div>
+            <input
+              key={i}
+              id={`id-box-${field}-${i}`}
+              type="text"
+              maxLength={1}
+              value={char === ' ' ? '' : char}
+              onChange={(e) => handleChange(i, e.target.value)}
+              onKeyDown={(e) => handleKeyDown(i, e)}
+              className={cn(
+                "w-5 h-6 border border-slate-400 text-center font-bold text-blue-800 bg-white outline-none",
+                !isPDF && "focus:ring-1 focus:ring-blue-500",
+                (i === 0 || i === 4 || i === 9 || i === 11) && "mr-1"
+              )}
+              readOnly={isPDF}
+            />
           ))}
         </div>
       );
@@ -558,7 +444,7 @@ export default function HomeVisitSystem() {
                 <span>1. ชื่อนักเรียน</span>
                 <input 
                   type="text" 
-                  value={student ? `${student.firstName}` : ''}
+                  value={student ? `${student.prefix || ''}${student.firstName}` : ''}
                   className="w-40 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
                   readOnly
                 />
@@ -579,7 +465,7 @@ export default function HomeVisitSystem() {
               </div>
               <div className="flex flex-wrap gap-4 items-center">
                 <span>เลขที่บัตรประชาชน</span>
-                {renderIdCardBoxes(data.studentIdCard)}
+                {renderIdCardBoxes(data.studentIdCard, 'studentIdCard')}
               </div>
 
               <div className="flex flex-wrap gap-2 items-center">
@@ -645,7 +531,7 @@ export default function HomeVisitSystem() {
 
               <div className="flex flex-wrap gap-4 items-center">
                 <span>เลขที่บัตรประชาชน</span>
-                {renderIdCardBoxes(data.parentIdCard)}
+                {renderIdCardBoxes(data.parentIdCard, 'parentIdCard')}
                 <label className="flex items-center gap-1 cursor-pointer">
                   <div className={cn("w-4 h-4 rounded-full border border-slate-400 flex items-center justify-center", data.hasNoIdCard && "bg-blue-600 border-blue-600")}>
                     {data.hasNoIdCard && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
@@ -1013,230 +899,147 @@ export default function HomeVisitSystem() {
               </div>
             </div>
 
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+            <div className="flex flex-wrap gap-2 items-center">
+              <span>5.4 รายได้ครัวเรือนเฉลี่ยต่อคน (รวมรายได้ครัวเรือน หารด้วยจำนวนสมาชิกทั้งหมด)</span>
+              <input 
+                type="number" 
+                value={data.householdStatus.averageIncomePerPerson || ''}
+                onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, householdStatus: { ...prev.householdStatus, averageIncomePerPerson: Number(e.target.value) } }))}
+                className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
+                readOnly={isPDF}
+              />
+              <span>บาท (กรอกเฉพาะกรณีนักเรียนไม่ยากจนเท่านั้น)</span>
+            </div>
 
-  const renderPage3 = (data: HomeVisitData, isPDF = false) => (
-    <div 
-      className={cn(
-        "bg-white relative text-slate-800 font-sans leading-relaxed border border-slate-200",
-        isPDF ? "p-[1.5cm] w-[210mm] min-h-[29.7cm] text-[11px]" : "shadow-2xl mx-auto p-[1.5cm] md:p-[2cm] min-h-[29.7cm] text-sm"
-      )}
-      id={isPDF ? undefined : "form-page-3"}
-      style={{ fontFamily: "'Sarabun', sans-serif" }}
-    >
-      <div className="flex justify-between items-start mb-2">
-        <div className="flex-1"></div>
-        <div className="text-center flex-1">
-          <h2 className="text-xl font-bold text-slate-900">บันทึกการเยี่ยมบ้าน</h2>
-        </div>
-        <div className="flex-1 text-right text-xs text-slate-400">หน้า 3/4</div>
-      </div>
-
-      <div className="border-t border-slate-800 my-2"></div>
-
-      <div className="space-y-4">
-        <div className="flex flex-wrap gap-2 items-center">
-          <span>5.4 รายได้ครัวเรือนเฉลี่ยต่อคน (รวมรายได้ครัวเรือน หารด้วยจำนวนสมาชิกทั้งหมด)</span>
-          <input 
-            type="number" 
-            value={data.householdStatus.averageIncomePerPerson || ''}
-            onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, householdStatus: { ...prev.householdStatus, averageIncomePerPerson: Number(e.target.value) } }))}
-            className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
-            readOnly={isPDF}
-          />
-          <span>บาท (กรอกเฉพาะกรณีนักเรียนไม่ยากจนเท่านั้น)</span>
-        </div>
-
-        <div className="space-y-2">
-          <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-            <span>5.5 นักเรียนได้รับค่าใช้จ่ายจาก</span>
-            <input 
-              type="text" 
-              value={data.studentFinance.incomeSource || ''}
-              onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, incomeSource: e.target.value } }))}
-              className="w-48 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
-              readOnly={isPDF}
-            />
-            <span>นักเรียนทำงานหารายได้ อาชีพ</span>
-            <input 
-              type="text" 
-              value={data.studentFinance.occupation || ''}
-              onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, occupation: e.target.value } }))}
-              className="w-48 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
-              readOnly={isPDF}
-            />
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-            <span>รายได้วันละ</span>
-            <input 
-              type="number" 
-              value={data.studentFinance.dailyIncome || ''}
-              onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, dailyIncome: Number(e.target.value) } }))}
-              className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
-              readOnly={isPDF}
-            />
-            <span>บาท</span>
-            <span>นักเรียนได้เงินมาโรงเรียนวันละ</span>
-            <input 
-              type="number" 
-              value={data.studentFinance.dailyAllowance || ''}
-              onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, dailyAllowance: Number(e.target.value) } }))}
-              className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
-              readOnly={isPDF}
-            />
-            <span>บาท</span>
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-            <span>นักเรียนทำงานหารายได้พิเศษ</span>
-            <label className="flex items-center gap-1 cursor-pointer">
-              <div className={cn("w-3.5 h-3.5 rounded-full border border-slate-800 flex items-center justify-center", data.studentFinance.hasWork && "bg-slate-800")}>
-                {data.studentFinance.hasWork && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
-              </div>
-              <input type="radio" checked={data.studentFinance.hasWork} onChange={() => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, hasWork: true } }))} className="hidden" />
-              <span>มี</span>
-            </label>
-            <label className="flex items-center gap-1 cursor-pointer">
-              <div className={cn("w-3.5 h-3.5 rounded-full border border-slate-800 flex items-center justify-center", !data.studentFinance.hasWork && "bg-slate-800")}>
-                {!data.studentFinance.hasWork && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
-              </div>
-              <input type="radio" checked={!data.studentFinance.hasWork} onChange={() => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, hasWork: false } }))} className="hidden" />
-              <span>ไม่มี</span>
-            </label>
-            {data.studentFinance.hasWork && (
-              <>
-                <span>ระบุ</span>
+            <div className="space-y-2">
+              <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
+                <span>5.5 นักเรียนได้รับค่าใช้จ่ายจาก</span>
                 <input 
                   type="text" 
-                  value={data.studentFinance.workDescription || ''}
-                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, workDescription: e.target.value } }))}
+                  value={data.studentFinance.incomeSource || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, incomeSource: e.target.value } }))}
                   className="w-48 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
                   readOnly={isPDF}
                 />
-              </>
-            )}
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-            <span>ภาระหนี้สินของครัวเรือน</span>
-            <label className="flex items-center gap-1 cursor-pointer">
-              <div className={cn("w-3.5 h-3.5 rounded-full border border-slate-800 flex items-center justify-center", data.studentFinance.hasDebt && "bg-slate-800")}>
-                {data.studentFinance.hasDebt && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                <span>นักเรียนทำงานหารายได้ อาชีพ</span>
+                <input 
+                  type="text" 
+                  value={data.studentFinance.occupation || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, occupation: e.target.value } }))}
+                  className="w-48 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
+                  readOnly={isPDF}
+                />
               </div>
-              <input type="radio" checked={data.studentFinance.hasDebt} onChange={() => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, hasDebt: true } }))} className="hidden" />
-              <span>มี</span>
-            </label>
-            <label className="flex items-center gap-1 cursor-pointer">
-              <div className={cn("w-3.5 h-3.5 rounded-full border border-slate-800 flex items-center justify-center", !data.studentFinance.hasDebt && "bg-slate-800")}>
-                {!data.studentFinance.hasDebt && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
-              </div>
-              <input type="radio" checked={!data.studentFinance.hasDebt} onChange={() => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, hasDebt: false } }))} className="hidden" />
-              <span>ไม่มี</span>
-            </label>
-            {data.studentFinance.hasDebt && (
-              <>
-                <span>จำนวน</span>
+              <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
+                <span>รายได้วันละ</span>
                 <input 
                   type="number" 
-                  value={data.studentFinance.debtAmount || ''}
-                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, debtAmount: Number(e.target.value) } }))}
+                  value={data.studentFinance.dailyIncome || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, dailyIncome: Number(e.target.value) } }))}
                   className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
                   readOnly={isPDF}
                 />
                 <span>บาท</span>
-              </>
-            )}
-          </div>
-        </div>
-
-        <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-          <span>5.6 สิ่งที่ผู้ปกครองต้องการให้โรงเรียนช่วยเหลือนักเรียน</span>
-          <div className="flex flex-wrap gap-4 pl-4">
-            {['ด้านการเรียน', 'ด้านพฤติกรรม', 'ด้านเศรษฐกิจ (เช่น ขอรับทุน)', 'อื่นๆ ระบุ'].map((v) => (
-              <label key={v} className="flex items-center gap-1 cursor-pointer">
-                <div className={cn("w-3.5 h-3.5 border border-slate-800 flex items-center justify-center", data.helpNeeded?.includes(v) && "bg-slate-800")}>
-                  {data.helpNeeded?.includes(v) && <div className="w-1.5 h-1.5 bg-white"></div>}
-                </div>
+                <span>นักเรียนได้เงินมาโรงเรียนวันละ</span>
                 <input 
-                  type="checkbox" 
-                  checked={data.helpNeeded?.includes(v)} 
-                  onChange={() => {
-                    if (!isPDF) {
-                      const current = data.helpNeeded || [];
-                      const updated = current.includes(v) ? current.filter(item => item !== v) : [...current, v];
-                      setFormData(prev => ({ ...prev, helpNeeded: updated }));
-                    }
-                  }} 
-                  className="hidden" 
+                  type="number" 
+                  value={data.studentFinance.dailyAllowance || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, studentFinance: { ...prev.studentFinance, dailyAllowance: Number(e.target.value) } }))}
+                  className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
+                  readOnly={isPDF}
                 />
-                <span>{v}</span>
-                {v === 'อื่นๆ ระบุ' && data.helpNeeded?.includes('อื่นๆ ระบุ') && (
-                  <input 
-                    type="text" 
-                    value={data.helpNeededOther || ''}
-                    onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, helpNeededOther: e.target.value }))}
-                    className="w-40 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
-                    readOnly={isPDF}
-                  />
-                )}
-              </label>
-            ))}
-          </div>
-        </div>
+                <span>บาท</span>
+              </div>
+            </div>
 
-        <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
-          <span>5.7 ความช่วยเหลือที่ครอบครัวเคยได้รับจากหน่วยงานหรือต้องการได้รับความช่วยเหลือ</span>
-          <div className="flex flex-wrap gap-4 pl-4">
-            {[
-              { id: 'elderly', label: 'เบี้ยผู้สูงอายุ' },
-              { id: 'disability', label: 'เบี้ยพิการ' },
-              { id: 'others', label: 'อื่นๆ ระบุ' }
-            ].map((v) => (
-              <label key={v.id} className="flex items-center gap-1 cursor-pointer">
-                <div className={cn("w-3.5 h-3.5 border border-slate-800 flex items-center justify-center", (v.id === 'others' ? !!data.assistanceReceived.others : data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]) && "bg-slate-800")}>
-                  {(v.id === 'others' ? !!data.assistanceReceived.others : data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]) && <div className="w-1.5 h-1.5 bg-white"></div>}
-                </div>
-                <input 
-                  type="checkbox" 
-                  checked={v.id === 'others' ? !!data.assistanceReceived.others : !!data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]} 
-                  onChange={(e) => {
-                    if (!isPDF) {
-                      if (v.id === 'others') {
-                        setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, others: e.target.checked ? 'ระบุ...' : '' } }));
-                      } else {
-                        setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, [v.id]: e.target.checked } }));
-                      }
-                    }
-                  }} 
-                  className="hidden" 
-                />
-                <span>{v.label}</span>
-                {v.id === 'others' && data.assistanceReceived.others && (
-                  <input 
-                    type="text" 
-                    value={data.assistanceReceived.details || ''}
-                    onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, details: e.target.value } }))}
-                    className="w-64 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
-                    readOnly={isPDF}
-                  />
-                )}
-              </label>
-            ))}
-          </div>
-        </div>
+            <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
+              <span>5.6 สิ่งที่ผู้ปกครองต้องการให้โรงเรียนช่วยเหลือนักเรียน</span>
+              <div className="flex flex-wrap gap-4 pl-4">
+                {['ด้านการเรียน', 'ด้านพฤติกรรม', 'ด้านเศรษฐกิจ (เช่น ขอรับทุน)', 'อื่นๆ ระบุ'].map((v) => (
+                  <label key={v} className="flex items-center gap-1 cursor-pointer">
+                    <div className={cn("w-3.5 h-3.5 border border-slate-800 flex items-center justify-center", data.helpNeeded?.includes(v) && "bg-slate-800")}>
+                      {data.helpNeeded?.includes(v) && <div className="w-1.5 h-1.5 bg-white"></div>}
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      checked={data.helpNeeded?.includes(v)} 
+                      onChange={() => {
+                        if (!isPDF) {
+                          const current = data.helpNeeded || [];
+                          const updated = current.includes(v) ? current.filter(item => item !== v) : [...current, v];
+                          setFormData(prev => ({ ...prev, helpNeeded: updated }));
+                        }
+                      }} 
+                      className="hidden" 
+                    />
+                    <span>{v}</span>
+                    {v === 'อื่นๆ ระบุ' && data.helpNeeded?.includes('อื่นๆ ระบุ') && (
+                      <input 
+                        type="text" 
+                        value={data.helpNeededOther || ''}
+                        onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, helpNeededOther: e.target.value }))}
+                        className="w-40 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
+                        readOnly={isPDF}
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+            </div>
 
-        <div className="space-y-1">
-          <span>5.8 ข้อห่วงใยของผู้ปกครองที่มีต่อนักเรียน</span>
-          <textarea 
-            value={data.parentConcerns || ''}
-            onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, parentConcerns: e.target.value }))}
-            className="w-full border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 resize-none overflow-hidden min-h-[4rem]"
-            rows={2}
-            readOnly={isPDF}
-            style={{ backgroundImage: 'linear-gradient(transparent, transparent 31px, #94a3b8 31px)', backgroundSize: '100% 32px', lineHeight: '32px' }}
-          />
+            <div className="flex flex-wrap gap-x-6 gap-y-2 items-center">
+              <span>5.7 ความช่วยเหลือที่ครอบครัวเคยได้รับจากหน่วยงานหรือต้องการได้รับความช่วยเหลือ</span>
+              <div className="flex flex-wrap gap-4 pl-4">
+                {[
+                  { id: 'elderly', label: 'เบี้ยผู้สูงอายุ' },
+                  { id: 'disability', label: 'เบี้ยพิการ' },
+                  { id: 'others', label: 'อื่นๆ ระบุ' }
+                ].map((v) => (
+                  <label key={v.id} className="flex items-center gap-1 cursor-pointer">
+                    <div className={cn("w-3.5 h-3.5 border border-slate-800 flex items-center justify-center", (v.id === 'others' ? !!data.assistanceReceived.others : data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]) && "bg-slate-800")}>
+                      {(v.id === 'others' ? !!data.assistanceReceived.others : data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]) && <div className="w-1.5 h-1.5 bg-white"></div>}
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      checked={v.id === 'others' ? !!data.assistanceReceived.others : !!data.assistanceReceived[v.id as keyof typeof data.assistanceReceived]} 
+                      onChange={(e) => {
+                        if (!isPDF) {
+                          if (v.id === 'others') {
+                            setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, others: e.target.checked ? 'ระบุ...' : '' } }));
+                          } else {
+                            setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, [v.id]: e.target.checked } }));
+                          }
+                        }
+                      }} 
+                      className="hidden" 
+                    />
+                    <span>{v.label}</span>
+                    {v.id === 'others' && data.assistanceReceived.others && (
+                      <input 
+                        type="text" 
+                        value={data.assistanceReceived.details || ''}
+                        onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, assistanceReceived: { ...prev.assistanceReceived, details: e.target.value } }))}
+                        className="w-64 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800"
+                        readOnly={isPDF}
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <span>5.8 ข้อห่วงใยของผู้ปกครองที่มีต่อนักเรียน</span>
+              <textarea 
+                value={data.parentConcerns || ''}
+                onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, parentConcerns: e.target.value }))}
+                className="w-full border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 resize-none overflow-hidden min-h-[4rem]"
+                rows={2}
+                readOnly={isPDF}
+                style={{ backgroundImage: 'linear-gradient(transparent, transparent 31px, #94a3b8 31px)', backgroundSize: '100% 32px', lineHeight: '32px' }}
+              />
+            </div>
+          </div>
         </div>
 
         {/* Section 6 */}
@@ -1345,7 +1148,30 @@ export default function HomeVisitSystem() {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
 
+  const renderPage3 = (data: HomeVisitData, isPDF = false) => (
+    <div 
+      className={cn(
+        "bg-white relative text-slate-800 font-sans leading-relaxed border border-slate-200",
+        isPDF ? "p-[1.5cm] w-[210mm] min-h-[29.7cm] text-[11px]" : "shadow-2xl mx-auto p-[1.5cm] md:p-[2cm] min-h-[29.7cm] text-sm"
+      )}
+      id={isPDF ? undefined : "form-page-3"}
+      style={{ fontFamily: "'Sarabun', sans-serif" }}
+    >
+      <div className="flex justify-between items-start mb-2">
+        <div className="flex-1"></div>
+        <div className="text-center flex-1">
+          <h2 className="text-xl font-bold text-slate-900">บันทึกการเยี่ยมบ้าน</h2>
+        </div>
+        <div className="flex-1 text-right text-xs text-slate-400">หน้า 3/4</div>
+      </div>
+
+      <div className="border-t border-slate-800 my-2"></div>
+
+      <div className="space-y-4">
         {/* 6.4 Responsibilities */}
         <div className="space-y-1">
           <p className="font-bold">6.4. ภาระงานความรับผิดชอบของนักเรียนที่มีต่อครอบครัว</p>
@@ -1556,640 +1382,611 @@ export default function HomeVisitSystem() {
           </div>
         </div>
 
-        {/* Teacher Summary */}
-        <div className="space-y-1">
-          <p className="font-bold">สรุปความเห็นของครูที่ปรึกษา/ครูผู้เยี่ยมบ้าน</p>
-          <textarea 
-            value={data.teacherSummary || ''}
-            onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, teacherSummary: e.target.value }))}
-            className="w-full border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 resize-none overflow-hidden min-h-[4rem]"
-            rows={2}
-            readOnly={isPDF}
-            style={{ backgroundImage: 'linear-gradient(transparent, transparent 31px, #94a3b8 31px)', backgroundSize: '100% 32px', lineHeight: '32px' }}
-          />
+        {/* Informant */}
+        <div className="space-y-2 pt-2">
+          <p className="font-bold">ผู้ให้ข้อมูลนักเรียน</p>
+          <div className="grid grid-cols-6 gap-x-2 gap-y-2 pl-4">
+            {[
+              'บิดา', 'มารดา', 'พี่ชาย', 'พี่สาว', 'น้า', 'อา',
+              'ป้า', 'ลุง', 'ปู่', 'ย่า', 'ตา', 'ยาย',
+              'ทวด', 'พ่อเลี้ยง', 'แม่เลี้ยง'
+            ].map(v => (
+              <label key={v} className="flex items-center gap-2 cursor-pointer">
+                <div className={cn("w-3.5 h-3.5 rounded-full border border-slate-800 flex items-center justify-center", data.informant === v && "bg-slate-800")}>
+                  {data.informant === v && <div className="w-1.5 h-1.5 bg-white rounded-full"></div>}
+                </div>
+                <input type="radio" checked={data.informant === v} onChange={() => !isPDF && setFormData(prev => ({ ...prev, informant: v }))} className="hidden" />
+                <span className="text-[11px]">{v}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="pt-12 space-y-4">
+          <div className="flex flex-col items-end space-y-2">
+            <div className="w-[350px] text-center space-y-4">
+              <p>ขอรับรองว่าข้อมูลดังกล่าวเป็นจริง</p>
+              <div className="space-y-4">
+                <div className="flex flex-col items-center gap-2">
+                  <div className="flex items-center justify-center gap-2 w-full">
+                    <span className="whitespace-nowrap">ลงชื่อผู้ปกครอง/ผู้แทน</span>
+                    <div className="flex-1 border-b border-dotted border-slate-400 min-w-[200px] relative h-16">
+                      {isPDF || data.parentSignature ? (
+                        data.parentSignature ? (
+                          <img src={data.parentSignature} className="h-full mx-auto object-contain" alt="Signature" />
+                        ) : (
+                          <div className="h-full"></div>
+                        )
+                      ) : (
+                        <SignatureCanvas 
+                          ref={signaturePadRef}
+                          penColor='blue'
+                          canvasProps={{ className: "w-full h-full border border-slate-100 rounded bg-slate-50/30" }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                  {!isPDF && (
+                    <div className="flex gap-2 justify-center mt-2">
+                      <button 
+                        onClick={() => {
+                          if (signaturePadRef.current) {
+                            setFormData(prev => ({ ...prev, parentSignature: signaturePadRef.current!.toDataURL() }));
+                          }
+                        }}
+                        className="text-[10px] text-blue-500 hover:underline font-bold"
+                      >
+                        บันทึกลายเซ็น
+                      </button>
+                      <button 
+                        onClick={() => {
+                          signaturePadRef.current?.clear();
+                          setFormData(prev => ({ ...prev, parentSignature: '' }));
+                        }}
+                        className="text-[10px] text-red-500 hover:underline font-bold"
+                      >
+                        ล้างลายเซ็น
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center justify-center gap-2">
+                  <span>(</span>
+                  <input 
+                    type="text" 
+                    placeholder="พิมพ์ชื่อ-นามสกุล"
+                    value={data.parentSignatureName || ''}
+                    onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, parentSignatureName: e.target.value }))}
+                    className="flex-1 border-b border-dotted border-slate-400 outline-none bg-transparent text-center font-bold text-blue-800"
+                    readOnly={isPDF}
+                  />
+                  <span>)</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 
-  const renderPage4 = (data: HomeVisitData, isPDF = false) => (
-    <div 
-      className={cn(
-        "bg-white relative text-slate-800 font-sans leading-relaxed border border-slate-200",
-        isPDF ? "p-[1.5cm] w-[210mm] min-h-[29.7cm] text-[11px]" : "shadow-2xl mx-auto p-[1.5cm] md:p-[2cm] min-h-[29.7cm] text-sm"
-      )}
-      id={isPDF ? undefined : "form-page-4"}
-      style={{ fontFamily: "'Sarabun', sans-serif" }}
-    >
-      <div className="flex justify-between items-start mb-2">
-        <div className="flex-1"></div>
-        <div className="text-center flex-1">
-          <h2 className="text-xl font-bold text-slate-900">บันทึกการเยี่ยมบ้าน</h2>
-        </div>
-        <div className="flex-1 text-right text-xs text-slate-400">หน้า 4/4</div>
-      </div>
-
-      <div className="border-t border-slate-800 my-2"></div>
-
-      <div className="space-y-8">
-        <div className="text-center space-y-4">
-          <p className="font-bold text-lg underline">ภาพถ่ายบ้านนักเรียน</p>
-          
-          <div className="grid grid-cols-1 gap-8">
-            <div className="space-y-2">
-              <p className="font-bold italic text-slate-600">รูปที่ 1 ภาพถ่ายสภาพบ้านนักเรียน (ภายนอก)</p>
-              <div className="w-full aspect-video bg-slate-100 rounded-2xl border-2 border-dashed border-slate-300 flex items-center justify-center overflow-hidden relative group">
-                {data.photos.exterior ? (
-                  <>
-                    <img src={data.photos.exterior} alt="Exterior" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                    {!isPDF && (
-                      <button 
-                        onClick={() => setFormData(prev => ({ ...prev, photos: { ...prev.photos, exterior: '' } }))}
-                        className="absolute top-4 right-4 p-2 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    )}
-                  </>
-                ) : (
-                  <label className="cursor-pointer flex flex-col items-center gap-2 text-slate-400 hover:text-blue-500 transition-colors">
-                    <Camera size={48} strokeWidth={1.5} />
-                    <span className="font-medium">คลิกเพื่ออัปโหลดรูปภาพภายนอกบ้าน</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={(e) => handlePhotoUpload(e, 'exterior')} />
-                  </label>
-                )}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <p className="font-bold italic text-slate-600">รูปที่ 2 ภาพถ่ายภายในบ้านนักเรียน</p>
-              <div className="w-full aspect-video bg-slate-100 rounded-2xl border-2 border-dashed border-slate-300 flex items-center justify-center overflow-hidden relative group">
-                {data.photos.interior ? (
-                  <>
-                    <img src={data.photos.interior} alt="Interior" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                    {!isPDF && (
-                      <button 
-                        onClick={() => setFormData(prev => ({ ...prev, photos: { ...prev.photos, interior: '' } }))}
-                        className="absolute top-4 right-4 p-2 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    )}
-                  </>
-                ) : (
-                  <label className="cursor-pointer flex flex-col items-center gap-2 text-slate-400 hover:text-blue-500 transition-colors">
-                    <Camera size={48} strokeWidth={1.5} />
-                    <span className="font-medium">คลิกเพื่ออัปโหลดรูปภาพภายในบ้าน</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={(e) => handlePhotoUpload(e, 'interior')} />
-                  </label>
-                )}
-              </div>
-            </div>
+  const renderPage4 = (data: HomeVisitData, isPDF = false) => {
+    const student = students.find(s => s.id === selectedStudentId);
+    return (
+      <div 
+        className={cn(
+          "bg-white relative text-slate-800 font-sans leading-relaxed border border-slate-200",
+          isPDF ? "p-[1.5cm] w-[210mm] min-h-[29.7cm] text-[14px]" : "shadow-2xl mx-auto p-[1.5cm] md:p-[2cm] min-h-[29.7cm] text-sm"
+        )}
+        id={isPDF ? undefined : "form-page-4"}
+        style={{ fontFamily: "'Sarabun', sans-serif" }}
+      >
+        <div className="flex justify-between items-start mb-4">
+          <div className="flex-1"></div>
+          <div className="text-center flex-1">
+            <h2 className="text-2xl font-bold text-slate-900">บันทึกการเยี่ยมบ้าน</h2>
           </div>
+          <div className="flex-1 text-right text-xs text-slate-400">หน้า 4/4</div>
         </div>
 
-        <div className="mt-12 space-y-8">
+        <div className="border-t border-slate-800 my-4"></div>
+
+        <div className="space-y-6">
           <div className="text-center">
-            <p className="font-bold">ขอรับรองว่าข้อมูล และภาพถ่ายบ้านของนักเรียนเป็นความจริง</p>
+            <h3 className="text-lg font-bold text-slate-800 mb-2">ภาพถ่ายบ้านนักเรียนที่ได้รับการเยี่ยมบ้าน</h3>
           </div>
 
-          <div className="grid grid-cols-1 gap-8 max-w-md mx-auto">
-            <div className="text-center space-y-4">
-              <div className="border-b border-dotted border-slate-400 pb-2 min-h-[60px] flex flex-col items-center justify-center">
-                {data.parentSignature ? (
-                  <div className="relative group">
-                    <img src={data.parentSignature} alt="Signature" className="max-h-20 object-contain" referrerPolicy="no-referrer" />
-                    {!isPDF && (
-                      <button 
-                        onClick={() => setFormData(prev => ({ ...prev, parentSignature: '' }))}
-                        className="absolute -top-2 -right-8 p-1 bg-red-100 text-red-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    )}
-                  </div>
+          <div className="flex gap-2 items-center">
+            <span className="shrink-0">ชื่อ - นามสกุลนักเรียน</span>
+            <div className="flex-1 border-b border-dotted border-slate-400 font-bold text-blue-800 px-2 min-h-[1.5rem]">
+              {student?.prefix || ''}{student?.firstName} {student?.lastName}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex gap-4">
+              <span className="shrink-0">กรุณาระบุ ภาพถ่ายที่แนบมาคือ</span>
+              <div className="space-y-1 flex-1">
+                {[
+                  { id: 'parent', label: 'บ้านที่อาศัยอยู่กับพ่อแม่ (เป็นเจ้าของ/เช่า)' },
+                  { id: 'relative', label: 'บ้านของญาติ/ผู้ปกครองที่ไม่ใช่ญาติ' },
+                  { id: 'others', label: 'บ้านหรือที่พักประเภท วัด มูลนิธิ หอพัก โรงงาน อยู่กับนายจ้าง' },
+                  { id: 'unable', label: 'ภาพนักเรียนและป้ายชื่อโรงเรียนเนื่องจากถ่ายภาพบ้านไม่ได้ เพราะบ้านอยู่ต่างอำเภอ/ต่างจังหวัด/ต่างประเทศ หรือไม่ได้รับอนุญาตให้ถ่ายภาพ' }
+                ].map((v) => (
+                  <label key={v.id} className="flex items-start gap-2 cursor-pointer group">
+                    <div className={cn(
+                      "mt-1 w-4 h-4 border border-slate-800 flex items-center justify-center shrink-0 transition-colors",
+                      data.photoCategory === v.id ? "bg-slate-800" : "group-hover:bg-slate-100"
+                    )}>
+                      {data.photoCategory === v.id && <div className="w-1.5 h-1.5 bg-white"></div>}
+                    </div>
+                    <input 
+                      type="radio" 
+                      name="photoCategory"
+                      checked={data.photoCategory === v.id} 
+                      onChange={() => !isPDF && setFormData(prev => ({ ...prev, photoCategory: v.id }))} 
+                      className="hidden" 
+                    />
+                    <span className="text-[13px] leading-tight">{v.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-8 pt-4">
+            <div className="space-y-2">
+              <p className="text-center font-bold">รูปที่ 1 ภาพถ่ายสภาพบ้านนักเรียน</p>
+              <div className="w-full aspect-[16/9] border border-slate-800 relative overflow-hidden bg-slate-50 flex flex-col items-center justify-center group">
+                {data.photos.exterior ? (
+                  <img src={data.photos.exterior} className="w-full h-full object-contain" alt="Exterior" />
                 ) : (
-                  !isPDF && (
-                    <button 
-                      onClick={() => setShowSignaturePad(true)}
-                      className="text-blue-500 hover:text-blue-600 font-medium text-xs flex items-center gap-1"
-                    >
-                      <PenTool size={14} />
-                      คลิกเพื่อลงชื่อ (ผู้ปกครอง)
-                    </button>
-                  )
+                  <div className="text-center text-slate-400">
+                    <Camera size={48} className="mx-auto mb-2 opacity-20" />
+                    <p className="font-bold">มีหลังคาและฝาบ้านด้วย</p>
+                    {!isPDF && <p className="text-xs mt-1">(คลิกเพื่ออัปโหลด)</p>}
+                  </div>
+                )}
+                {!isPDF && <input type="file" accept="image/*" onChange={(e) => handleImageUpload(e, 'exterior')} className="absolute inset-0 opacity-0 cursor-pointer" />}
+                {data.photos.exterior && !isPDF && (
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setFormData(prev => ({ ...prev, photos: { ...prev.photos, exterior: '' } })); }}
+                    className="absolute top-2 right-2 p-1 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    <Trash2 size={16} />
+                  </button>
                 )}
               </div>
-              <div className="flex items-center justify-center gap-2">
-                <span>(ลงชื่อ)</span>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-center font-bold">รูปที่ 2 ภาพถ่ายภายในบ้านนักเรียน</p>
+              <div className="w-full aspect-[16/9] border border-slate-800 relative overflow-hidden bg-slate-50 flex flex-col items-center justify-center group">
+                {data.photos.interior ? (
+                  <img src={data.photos.interior} className="w-full h-full object-contain" alt="Interior" />
+                ) : (
+                  <div className="text-center text-slate-400">
+                    <Camera size={48} className="mx-auto mb-2 opacity-20" />
+                    <p className="font-bold">ภาพถ่ายภายในบ้านนักเรียน</p>
+                    {!isPDF && <p className="text-xs mt-1">(คลิกเพื่ออัปโหลด)</p>}
+                  </div>
+                )}
+                {!isPDF && <input type="file" accept="image/*" onChange={(e) => handleImageUpload(e, 'interior')} className="absolute inset-0 opacity-0 cursor-pointer" />}
+                {data.photos.interior && !isPDF && (
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setFormData(prev => ({ ...prev, photos: { ...prev.photos, interior: '' } })); }}
+                    className="absolute top-2 right-2 p-1 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="border border-slate-800 p-6 mt-8 space-y-6">
+            <p className="font-bold">ขอรับรองว่าข้อมูล และภาพถ่ายบ้านของนักเรียนเป็นความจริง</p>
+            
+            <div className="space-y-4 max-w-2xl mx-auto">
+              <div className="flex items-center gap-2">
+                <span className="shrink-0">(ลงชื่อ)</span>
+                <div className="flex-1 border-b border-dotted border-slate-400"></div>
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <span className="shrink-0">(</span>
                 <input 
                   type="text" 
-                  placeholder="ชื่อ-นามสกุล ผู้ปกครอง"
-                  value={data.parentSignatureName || ''}
-                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, parentSignatureName: e.target.value }))}
-                  className="w-64 border-b border-dotted border-slate-400 outline-none bg-transparent text-cen              new TextRun({ text: "4.3 สภาพที่อยู่อาศัย: ", font: "Sarabun" }),
-              new TextRun({ text: checkbox(visit.householdStatus.housingCondition === 'dilapidated') + "ชำรุดทรุดโทรม  ", font: "Sarabun" }),
-              new TextRun({ text: checkbox(visit.householdStatus.noToilet) + "ไม่มีห้องส้วม", font: "Sarabun" }),
-            ],
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "4.4 ยานพาหนะ: ", font: "Sarabun" }),
-              new TextRun({ text: `รถยนต์(${visit.householdStatus.vehicles.car ? 'มี' : 'ไม่มี'})  `, font: "Sarabun" }),
-              new TextRun({ text: `รถปิกอัพ(${visit.householdStatus.vehicles.pickup ? 'มี' : 'ไม่มี'})  `, font: "Sarabun" }),
-              new TextRun({ text: `รถไถ(${visit.householdStatus.vehicles.tractor ? 'มี' : 'ไม่มี'})`, font: "Sarabun" }),
-            ],
-          }),
+                  value={data.certification?.signerName || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, certification: { ...prev.certification, signerName: e.target.value } }))}
+                  className="flex-1 border-b border-dotted border-slate-400 outline-none bg-transparent px-2 font-bold text-blue-800 text-center"
+                  placeholder="ชื่อ-นามสกุล"
+                  readOnly={isPDF}
+                />
+                <span className="shrink-0">)</span>
+              </div>
 
-          new Paragraph({ children: [new PageBreak()] }),
+              <div className="flex items-center gap-2">
+                <span className="shrink-0">ตำแหน่ง</span>
+                <input 
+                  type="text" 
+                  value={data.certification?.position || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, certification: { ...prev.certification, position: e.target.value } }))}
+                  className="flex-1 border-b border-dotted border-slate-400 outline-none bg-transparent px-2 font-bold text-blue-800"
+                  placeholder="ระบุตำแหน่ง"
+                  readOnly={isPDF}
+                />
+                <span className="shrink-0">(ครูหรือผู้อำนวยการโรงเรียน)</span>
+              </div>
 
-          // Page 2
-          new Paragraph({
-            children: [new TextRun({ text: "บันทึกการเยี่ยมบ้าน (ต่อ)", bold: true, size: 28, font: "Sarabun" })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "5. ความสัมพันธ์ในครอบครัว", bold: true, font: "Sarabun" })],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `5.1 สมาชิกในครอบครัวมีเวลาอยู่ร่วมกัน: ${visit.familyRelationship.timeTogether || "0"} ชั่วโมง/วัน`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "5.2 ความสัมพันธ์ระหว่างนักเรียนกับสมาชิกในครอบครัว:", font: "Sarabun" })],
-            spacing: { after: 100 },
-          }),
-          new Table({
-            width: { size: 100, type: WidthType.PERCENTAGE },
-            rows: [
-              new TableRow({
-                children: [
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "สมาชิก", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "สนิทสนม", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "เฉยๆ", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ห่างเหิน", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ขัดแย้ง", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ไม่มี", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                ],
-              }),
-              ...['บิดา', 'มารดา', 'พี่ชาย/น้องชาย', 'พี่สาว/น้องสาว', 'ปู่/ย่า/ตา/ยาย', 'ญาติ', 'อื่นๆ'].map(member => new TableRow({
-                children: [
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: member, font: "Sarabun", size: 20 })] })] }),
-                  ...['close', 'normal', 'distant', 'conflict', 'none'].map(level => new TableCell({
-                    children: [new Paragraph({ children: [new TextRun({ text: visit.familyRelationship.memberRelations[member] === level ? "●" : "", font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })]
-                  }))
-                ],
-              })),
-            ],
-          }),
-          new Paragraph({ text: "", spacing: { after: 200 } }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "5.3 กรณีผู้ปกครองไม่อยู่บ้าน ฝากเด็กไว้กับ: ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'relatives') + "ญาติ  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'neighbors') + "เพื่อนบ้าน  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'alone') + "อยู่คนเดียว  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'others') + "อื่นๆ: " + (visit.familyRelationship.guardianOthersDetail || ""), font: "Sarabun" }),
-            ],
-            spacing: { after: 200 },
-          }),
+              <div className="flex items-center gap-2 justify-center">
+                <span className="shrink-0">วันที่</span>
+                <input 
+                  type="text" 
+                  value={data.certification?.day || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, certification: { ...prev.certification, day: e.target.value } }))}
+                  className="w-12 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 text-center"
+                  readOnly={isPDF}
+                />
+                <span className="shrink-0">เดือน</span>
+                <input 
+                  type="text" 
+                  value={data.certification?.month || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, certification: { ...prev.certification, month: e.target.value } }))}
+                  className="w-32 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 text-center"
+                  readOnly={isPDF}
+                />
+                <span className="shrink-0">พ.ศ.</span>
+                <input 
+                  type="text" 
+                  value={data.certification?.year || ''}
+                  onChange={(e) => !isPDF && setFormData(prev => ({ ...prev, certification: { ...prev.certification, year: e.target.value } }))}
+                  className="w-20 border-b border-dotted border-slate-400 outline-none bg-transparent px-1 font-bold text-blue-800 text-center"
+                  readOnly={isPDF}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
-          new Paragraph({ children: [new PageBreak()] }),
+  const fetchStudents = async () => {
+    try {
+      const studentList = await fetchStudentsForUser();
+      setStudents(studentList);
+    } catch (error) {
+      console.error('Error fetching students:', error);
+    }
+  };
 
-          // Page 3
-          new Paragraph({
-            children: [new TextRun({ text: "บันทึกการเยี่ยมบ้าน (ต่อ)", bold: true, size: 28, font: "Sarabun" })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `5.4 รายได้ครัวเรือนเฉลี่ยต่อคน: ${visit.householdStatus.averageIncomePerPerson || "0"} บาท`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `5.5 นักเรียนได้รับค่าใช้จ่ายจาก: ${visit.studentFinance.incomeSource || "-"}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `ได้เงินมาโรงเรียนวันละ: ${visit.studentFinance.dailyAllowance || "0"} บาท`, font: "Sarabun" }),
-              new TextRun({ text: `\tภาระหนี้สิน: ${visit.studentFinance.hasDebt ? visit.studentFinance.debtAmount + ' บาท' : 'ไม่มี'}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "5.6 สิ่งที่ต้องการให้โรงเรียนช่วยเหลือ: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.helpNeeded || []).join(", "), font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "5.7 ข้อห่วงใยของผู้ปกครอง:", font: "Sarabun", bold: true })],
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: visit.parentConcerns || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
+  const fetchVisits = async () => {
+    try {
+      const q = query(collection(db, 'homeVisits'), orderBy('date', 'desc'));
+      const querySnapshot = await getDocs(q);
+      const visitList = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setVisits(visitList);
+    } catch (error) {
+      console.error('Error fetching visits:', error);
+    }
+  };
 
-          new Paragraph({
-            children: [new TextRun({ text: "6. พฤติกรรมและความเสี่ยง", bold: true, font: "Sarabun" })],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "6.1 สุขภาพ: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.behaviorRisks.health || []).join(", ") || "ปกติ", font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "6.2 สวัสดิการ/ความปลอดภัย: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.behaviorRisks.safety || []).join(", ") || "ปกติ", font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `6.3 ระยะทางไปโรงเรียน: ${visit.behaviorRisks.distanceToSchool || "0"} กม. `, font: "Sarabun" }),
-              new TextRun({ text: `เดินทางโดย: ${visit.behaviorRisks.travelMethod || "-"}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "สรุปความเห็นของครูที่ปรึกษา:", font: "Sarabun", bold: true })],
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: visit.teacherSummary || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
+  const fetchUserProfile = async () => {
+    if (auth.currentUser) {
+      try {
+        const userDoc = await getDoc(doc(db, 'users', auth.currentUser.uid));
+        if (userDoc.exists()) {
+          const profile = userDoc.data() as UserProfile;
+          setUserProfile(profile);
+          setFormData(prev => ({
+            ...prev,
+            certification: {
+              ...prev.certification,
+              signerName: prev.certification.signerName || profile.displayName || '',
+              position: prev.certification.position || profile.designation || 'ครูประจำชั้น'
+            }
+          }));
+        }
+      } catch (error) {
+        console.error('Error fetching user profile:', error);
+      }
+    }
+  };
 
-          new Paragraph({
-            children: [new TextRun({ text: "ผู้ให้ข้อมูล: ", font: "Sarabun", bold: true }), new TextRun({ text: visit.informant || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>, type: keyof HomeVisitData['photos']) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-          new Paragraph({ children: [new PageBreak()] }),
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64String = reader.result as string;
+      setFormData(prev => ({
+        ...prev,
+        photos: {
+          ...prev.photos,
+          [type]: base64String
+        }
+      }));
+    };
+    reader.readAsDataURL(file);
+  };
 
-          // Page 4
-          new Paragraph({
-            children: [new TextRun({ text: "ภาพถ่ายการเยี่ยมบ้าน", bold: true, size: 28, font: "Sarabun" })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
+  const handleSave = async () => {
+    if (!selectedStudentId) {
+      toast.error('กรุณาเลือกนักเรียน');
+      return;
+    }
 
-          ...(exteriorData ? [
-            new Paragraph({ text: "ภาพถ่ายสภาพบ้านนักเรียน (ภายนอก)", alignment: AlignmentType.CENTER, font: "Sarabun" }),
-            new Paragraph({
-              children: [
-                new ImageRun({
-                  data: base64ToUint8Array(exteriorData),
-                  transformation: { width: 450, height: 280 },
-                } as any),
-              ],
-              alignment: AlignmentType.CENTER,
-              spacing: { after: 200 },
-            }),
-          ] : []),
+    setLoading(true);
+    try {
+      const visitData = {
+        ...formData,
+        studentId: selectedStudentId,
+        teacherId: auth.currentUser?.uid,
+        teacherName: userProfile?.displayName,
+        date: serverTimestamp(),
+        createdAt: serverTimestamp()
+      };
 
-          ...(interiorData ? [
-            new Paragraph({ text: "ภาพถ่ายภายในบ้านนักเรียน", alignment: AlignmentType.CENTER, font: "Sarabun" }),
-            new Paragraph({
-              children: [
-                new ImageRun({
-                  data: base64ToUint8Array(interiorData),
-                  transformation: { width: 450, height: 280 },
-                } as any),
-              ],
-              alignment: AlignmentType.CENTER,
-              spacing: { after: 200 },
-            }),
-          ] : []),
+      await addDoc(collection(db, 'homeVisits'), visitData);
+      toast.success('บันทึกข้อมูลการเยี่ยมบ้านสำเร็จ');
+      fetchVisits();
+      setFormData(initialFormState);
+      setSelectedStudentId('');
+      setCurrentPage(1);
+    } catch (error) {
+      console.error('Error saving home visit:', error);
+      toast.error('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
+    } finally {
+      setLoading(false);
+    }
+  };
 
-          new Paragraph({ text: "", spacing: { before: 400 } }),
-          new Paragraph({
-            children: [new TextRun({ text: "ขอรับรองว่าข้อมูล และภาพถ่ายบ้านของนักเรียนเป็นความจริง", font: "Sarabun", bold: true })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
+  const addMember = () => {
+    const newMember: HouseholdMember = {
+      id: Date.now().toString(),
+      relationship: '',
+      age: 0,
+      education: '',
+      occupation: '',
+      disability: false,
+      incomeWages: 0,
+      incomeAgri: 0,
+      incomeBusiness: 0,
+      incomeWelfare: 0,
+      incomeOther: 0,
+      totalIncome: 0
+    };
+    setFormData(prev => ({
+      ...prev,
+      householdMembers: [...prev.householdMembers, newMember]
+    }));
+  };
 
-          new Paragraph({
-            children: [
-              new TextRun({ text: "(ลงชื่อ)...........................................................................", font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `( ${visit.certification?.signerName || "...................................................."} )`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `ตำแหน่ง ${visit.certification?.position || "...................................................."}`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `วันที่ ${visit.certification?.day || "........"} เดือน ${visit.certification?.month || "................"} พ.ศ. ${visit.certification?.year || "........"}`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          
-          new Paragraph({ text: "", spacing: { before: 400 } }),
-          
-          ...(parentSignatureData ? [
-            new Paragraph({
-              children: [
-                new TextRun({ text: "ลายเซ็นผู้ปกครอง", font: "Sarabun", bold: true }),
-              ],
-              alignment: AlignmentType.CENTER,
-              spacing: { after: 100 },
-            }),
-            new Paragraph({
-              children: [
-                new ImageRun({
-                  data: base64ToUint8Array(parentSignatureData),
-                  transformation: { width: 150, height: 75 },
-                } as any),
-              ],
-              alignment: AlignmentType.CENTER,
-            }),
-            new Paragraph({
-              children: [
-                new TextRun({ text: `( ${visit.parentSignatureName || "...................................................."} )`, font: "Sarabun" }),
-              ],
-              alignment: AlignmentType.CENTER,
-            }),
-          ] : []),
-        ],
-      }],
-    });
+  const removeMember = (id: string) => {
+    setFormData(prev => ({
+      ...prev,
+      householdMembers: prev.householdMembers.filter(m => m.id !== id)
+    }));
+  };
 
-    Packer.toBlob(doc).then(blob => {
-      saveAs(blob, `Home_Visit_${student?.firstName}_${student?.lastName}.docx`);
+  const updateMember = (id: string, field: string, value: any) => {
+    setFormData(prev => ({
+      ...prev,
+      householdMembers: prev.householdMembers.map(m => 
+        m.id === id ? { ...m, [field]: value } : m
+      )
+    }));
+  };
+
+  const toggleBehaviorRisk = (category: keyof HomeVisitData['behaviorRisks'], value: string) => {
+    setFormData(prev => {
+      const current = prev.behaviorRisks[category] as string[];
+      const updated = current.includes(value)
+        ? current.filter(v => v !== value)
+        : [...current, value];
+      return {
+        ...prev,
+        behaviorRisks: {
+          ...prev.behaviorRisks,
+          [category]: updated
+        }
+      };
     });
   };
 
-  return (TextRun({ text: radio(visit.householdStatus.housingType === 'rent') + "บ้านเช่า  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.householdStatus.housingType === 'others') + "อาศัยผู้อื่น", font: "Sarabun" }),
-            ],
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "4.3 สภาพที่อยู่อาศัย: ", font: "Sarabun" }),
-              new TextRun({ text: checkbox(visit.householdStatus.housingCondition === 'dilapidated') + "ชำรุดทรุดโทรม  ", font: "Sarabun" }),
-              new TextRun({ text: checkbox(visit.householdStatus.noToilet) + "ไม่มีห้องส้วม", font: "Sarabun" }),
-            ],
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "4.4 ยานพาหนะ: ", font: "Sarabun" }),
-              new TextRun({ text: `รถยนต์(${visit.householdStatus.vehicles.car ? 'มี' : 'ไม่มี'})  `, font: "Sarabun" }),
-              new TextRun({ text: `รถปิกอัพ(${visit.householdStatus.vehicles.pickup ? 'มี' : 'ไม่มี'})  `, font: "Sarabun" }),
-              new TextRun({ text: `รถไถ(${visit.householdStatus.vehicles.tractor ? 'มี' : 'ไม่มี'})`, font: "Sarabun" }),
-            ],
-          }),
+  const downloadPDF = async (visit: any) => {
+    setPdfVisitData(visit);
+    setIsGeneratingPDF(true);
+    setLoading(true);
 
-          new Paragraph({ children: [new PageBreak()] }),
+    // Give time for the hidden container to render
+    setTimeout(async () => {
+      try {
+        if (pdfContainerRef.current) {
+          const doc = new jsPDF('p', 'mm', 'a4');
+          await setupThaiFont(doc);
+          const pages = pdfContainerRef.current.children;
+          
+          for (let i = 0; i < pages.length; i++) {
+            const imgData = await toJpeg(pages[i] as HTMLElement, {
+              quality: 0.95,
+              backgroundColor: '#ffffff',
+              pixelRatio: 2,
+              style: {
+                transform: 'scale(1)',
+                transformOrigin: 'top left'
+              }
+            });
+            
+            if (i > 0) doc.addPage();
+            doc.addImage(imgData, 'JPEG', 0, 0, 210, 297);
+          }
+          
+          const student = students.find(s => s.id === visit.studentId);
+          doc.save(`HomeVisit_${student?.prefix || ''}${student?.firstName || 'Student'}_${student?.lastName || ''}.pdf`);
+        }
+      } catch (error) {
+        console.error('PDF Generation Error:', error);
+        toast.error('เกิดข้อผิดพลาดในการสร้าง PDF กรุณาลองใหม่อีกครั้ง');
+      } finally {
+        setIsGeneratingPDF(false);
+        setPdfVisitData(null);
+        setLoading(false);
+      }
+    }, 1000);
+  };
 
-          // Page 2
+
+  const downloadWord = async (visit: any) => {
+    const student = students.find(s => s.id === visit.studentId);
+    
+    const getBase64Data = (base64: string) => {
+      if (!base64) return null;
+      const parts = base64.split(',');
+      return parts.length > 1 ? parts[1] : null;
+    };
+
+    const base64ToUint8Array = (base64: string) => {
+      const binaryString = window.atob(base64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes;
+    };
+
+    const exteriorData = getBase64Data(visit.photos?.exterior);
+    const interiorData = getBase64Data(visit.photos?.interior);
+    const teacherStudentData = getBase64Data(visit.photos?.studentWithTeacher);
+    const studentVisitData = getBase64Data(visit.photos?.student);
+
+    const doc = new Document({
+      sections: [{
+        properties: {},
+        children: [
           new Paragraph({
-            children: [new TextRun({ text: "บันทึกการเยี่ยมบ้าน", bold: true, size: 32, font: "Sarabun" })],
+            text: "บันทึกการเยี่ยมบ้าน",
+            heading: HeadingLevel.HEADING_1,
             alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "หน้า 2/4", size: 20, font: "Sarabun" })],
-            alignment: AlignmentType.RIGHT,
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "5. ความสัมพันธ์ในครอบครัว", bold: true, font: "Sarabun" })],
-            spacing: { after: 100 },
           }),
           new Paragraph({
             children: [
-              new TextRun({ text: `5.1 สมาชิกในครอบครัวมีเวลาอยู่ร่วมกัน: ${visit.familyRelationship.timeTogether || "0"} ชั่วโมง/วัน`, font: "Sarabun" }),
+              new TextRun({ text: `โรงเรียน: ${visit.schoolName || '-'}`, bold: true }),
+              new TextRun({ text: `\t\t\tวันที่เยี่ยมบ้าน: ${visit.date && !isNaN(new Date(visit.date).getTime()) ? format(new Date(visit.date), 'dd MMMM yyyy', { locale: th }) : '-'}` }),
             ],
-            spacing: { after: 100 },
           }),
           new Paragraph({
-            children: [new TextRun({ text: "5.2 ความสัมพันธ์ระหว่างนักเรียนกับสมาชิกในครอบครัว:", font: "Sarabun" })],
-            spacing: { after: 100 },
+            children: [
+              new TextRun({ text: `ชื่อนักเรียน: ${student?.prefix || ''}${student?.firstName} ${student?.lastName}`, bold: true }),
+              new TextRun({ text: `\t\tชั้น: ${student?.classId || '-'}` }),
+            ],
           }),
+          new Paragraph({ text: "ข้อมูลผู้ปกครอง", heading: HeadingLevel.HEADING_2 }),
+          new Paragraph({ text: `ชื่อ-นามสกุล: ${visit.parentName} ${visit.parentSurname}` }),
+          new Paragraph({ text: `ความสัมพันธ์: ${visit.parentRelationship}` }),
+          new Paragraph({ text: `เบอร์โทรศัพท์: ${visit.parentPhone}` }),
+          
+          new Paragraph({ text: "สมาชิกในครัวเรือน", heading: HeadingLevel.HEADING_2 }),
           new Table({
             width: { size: 100, type: WidthType.PERCENTAGE },
             rows: [
               new TableRow({
                 children: [
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "สมาชิก", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "สนิทสนม", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "เฉยๆ", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ห่างเหิน", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ขัดแย้ง", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ไม่มี", bold: true, font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })] }),
+                  new TableCell({ children: [new Paragraph("ความสัมพันธ์")] }),
+                  new TableCell({ children: [new Paragraph("อายุ")] }),
+                  new TableCell({ children: [new Paragraph("การศึกษา")] }),
+                  new TableCell({ children: [new Paragraph("อาชีพ")] }),
+                  new TableCell({ children: [new Paragraph("พิการ")] }),
+                  new TableCell({ children: [new Paragraph("รายได้รวม")] }),
                 ],
               }),
-              ...['บิดา', 'มารดา', 'พี่ชาย/น้องชาย', 'พี่สาว/น้องสาว', 'ปู่/ย่า/ตา/ยาย', 'ญาติ', 'อื่นๆ'].map(member => new TableRow({
+              ...visit.householdMembers.map((m: any) => new TableRow({
                 children: [
-                  new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: member, font: "Sarabun", size: 20 })] })] }),
-                  ...['close', 'normal', 'distant', 'conflict', 'none'].map(level => new TableCell({
-                    children: [new Paragraph({ children: [new TextRun({ text: visit.familyRelationship.memberRelations[member] === level ? "●" : "", font: "Sarabun", size: 20 })], alignment: AlignmentType.CENTER })]
-                  }))
+                  new TableCell({ children: [new Paragraph(m.relationship)] }),
+                  new TableCell({ children: [new Paragraph(m.age.toString())] }),
+                  new TableCell({ children: [new Paragraph(m.education || "-")] }),
+                  new TableCell({ children: [new Paragraph(m.occupation || "-")] }),
+                  new TableCell({ children: [new Paragraph(m.disability ? "ใช่" : "ไม่ใช่")] }),
+                  new TableCell({ children: [new Paragraph((m.incomeWages + m.incomeAgri + m.incomeBusiness + m.incomeWelfare + m.incomeOther).toLocaleString())] }),
                 ],
               })),
             ],
           }),
-          new Paragraph({ text: "", spacing: { after: 200 } }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "5.3 กรณีผู้ปกครองไม่อยู่บ้าน ฝากเด็กไว้กับ: ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'relatives') + "ญาติ  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'neighbors') + "เพื่อนบ้าน  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'alone') + "อยู่คนเดียว  ", font: "Sarabun" }),
-              new TextRun({ text: radio(visit.familyRelationship.guardianIfAbsent === 'others') + "อื่นๆ: " + (visit.familyRelationship.guardianOthersDetail || ""), font: "Sarabun" }),
-            ],
-            spacing: { after: 200 },
-          }),
+          new Paragraph({ text: "" }),
 
-          new Paragraph({ children: [new PageBreak()] }),
-
-          // Page 3
-          new Paragraph({
-            children: [new TextRun({ text: "บันทึกการเยี่ยมบ้าน", bold: true, size: 32, font: "Sarabun" })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "หน้า 3/4", size: 20, font: "Sarabun" })],
-            alignment: AlignmentType.RIGHT,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `5.4 รายได้ครัวเรือนเฉลี่ยต่อคน: ${visit.householdStatus.averageIncomePerPerson || "0"} บาท`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `5.5 นักเรียนได้รับค่าใช้จ่ายจาก: ${visit.studentFinance.incomeSource || "-"}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `ได้เงินมาโรงเรียนวันละ: ${visit.studentFinance.dailyAllowance || "0"} บาท`, font: "Sarabun" }),
-              new TextRun({ text: `\tภาระหนี้สิน: ${visit.studentFinance.hasDebt ? visit.studentFinance.debtAmount + ' บาท' : 'ไม่มี'}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "5.6 สิ่งที่ต้องการให้โรงเรียนช่วยเหลือ: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.helpNeeded || []).join(", "), font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "5.8 ข้อห่วงใยของผู้ปกครอง:", font: "Sarabun", bold: true })],
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: visit.parentConcerns || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
-
-          new Paragraph({
-            children: [new TextRun({ text: "6. พฤติกรรมและความเสี่ยง", bold: true, font: "Sarabun" })],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "6.1 สุขภาพ: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.behaviorRisks.health || []).join(", ") || "ปกติ", font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: "6.2 สวัสดิการ/ความปลอดภัย: ", font: "Sarabun" }),
-              new TextRun({ text: (visit.behaviorRisks.safety || []).join(", ") || "ปกติ", font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `6.3 ระยะทางไปโรงเรียน: ${visit.behaviorRisks.distanceToSchool || "0"} กม. `, font: "Sarabun" }),
-              new TextRun({ text: `เดินทางโดย: ${visit.behaviorRisks.travelMethod || "-"}`, font: "Sarabun" }),
-            ],
-            spacing: { after: 100 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "สรุปความเห็นของครูที่ปรึกษา:", font: "Sarabun", bold: true })],
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: visit.teacherSummary || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
-
-          new Paragraph({
-            children: [new TextRun({ text: "ผู้ให้ข้อมูล: ", font: "Sarabun", bold: true }), new TextRun({ text: visit.informant || "-", font: "Sarabun" })],
-            spacing: { after: 200 },
-          }),
-
-          new Paragraph({ children: [new PageBreak()] }),
-
-          // Page 4
-          new Paragraph({
-            children: [new TextRun({ text: "บันทึกการเยี่ยมบ้าน", bold: true, size: 32, font: "Sarabun" })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "หน้า 4/4", size: 20, font: "Sarabun" })],
-            alignment: AlignmentType.RIGHT,
-          }),
-          new Paragraph({
-            children: [new TextRun({ text: "ภาพถ่ายบ้านนักเรียน", bold: true, font: "Sarabun", size: 28 })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
-
+          new Paragraph({ text: "ข้อมูลสภาพความเป็นอยู่และเศรษฐกิจ", heading: HeadingLevel.HEADING_2 }),
+          new Paragraph({ text: `สถานภาพที่อยู่อาศัย: ${visit.householdStatus.housingType}` }),
+          new Paragraph({ text: `ลักษณะบ้าน: ${visit.householdStatus.housingCondition}` }),
+          new Paragraph({ text: `วัสดุที่ใช้ทำบ้าน: ${visit.householdStatus.housingMaterial}` }),
+          new Paragraph({ text: `เงินค่าขนม: ${visit.studentFinance.dailyAllowance} บาท/วัน` }),
+          new Paragraph({ text: `ภาระหนี้สิน: ${visit.studentFinance.hasDebt ? visit.studentFinance.debtAmount + ' บาท' : 'ไม่มี'}` }),
+          
+          new Paragraph({ text: "สรุปผลการเยี่ยมบ้าน", heading: HeadingLevel.HEADING_2 }),
+          new Paragraph({ text: visit.teacherSummary || "-" }),
+          
+          new Paragraph({ text: "" }),
+          
           ...(exteriorData ? [
-            new Paragraph({ text: "รูปที่ 1 ภาพถ่ายสภาพบ้านนักเรียน (ภายนอก)", alignment: AlignmentType.CENTER, font: "Sarabun" }),
+            new Paragraph({ text: "รูปที่ 1 ภาพถ่ายสภาพบ้านนักเรียน (ภายนอก)", alignment: AlignmentType.CENTER }),
             new Paragraph({
               children: [
                 new ImageRun({
                   data: base64ToUint8Array(exteriorData),
-                  transformation: { width: 450, height: 280 },
+                  transformation: { width: 400, height: 250 },
                 } as any),
               ],
               alignment: AlignmentType.CENTER,
-              spacing: { after: 200 },
             }),
           ] : []),
 
           ...(interiorData ? [
-            new Paragraph({ text: "รูปที่ 2 ภาพถ่ายภายในบ้านนักเรียน", alignment: AlignmentType.CENTER, font: "Sarabun" }),
+            new Paragraph({ text: "รูปที่ 2 ภาพถ่ายภายในบ้านนักเรียน", alignment: AlignmentType.CENTER }),
             new Paragraph({
               children: [
                 new ImageRun({
                   data: base64ToUint8Array(interiorData),
-                  transformation: { width: 450, height: 280 },
+                  transformation: { width: 400, height: 250 },
                 } as any),
               ],
               alignment: AlignmentType.CENTER,
-              spacing: { after: 200 },
             }),
           ] : []),
 
-          new Paragraph({ text: "", spacing: { before: 400 } }),
-          new Paragraph({
-            children: [new TextRun({ text: "ขอรับรองว่าข้อมูล และภาพถ่ายบ้านของนักเรียนเป็นความจริง", font: "Sarabun", bold: true })],
-            alignment: AlignmentType.CENTER,
-            spacing: { after: 200 },
-          }),
+          ...(teacherStudentData ? [
+            new Paragraph({ text: "รูปที่ 3 ภาพถ่ายครูเยี่ยมบ้านนักเรียน", alignment: AlignmentType.CENTER }),
+            new Paragraph({
+              children: [
+                new ImageRun({
+                  data: base64ToUint8Array(teacherStudentData),
+                  transformation: { width: 400, height: 250 },
+                } as any),
+              ],
+              alignment: AlignmentType.CENTER,
+            }),
+          ] : []),
 
-          new Paragraph({
-            children: [
-              new TextRun({ text: "(ลงชื่อ)...........................................................................", font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `( ${visit.certification?.signerName || "...................................................."} )`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `ตำแหน่ง ${visit.certification?.position || "...................................................."}`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
-          new Paragraph({
-            children: [
-              new TextRun({ text: `วันที่ ${visit.certification?.day || "........"} เดือน ${visit.certification?.month || "................"} พ.ศ. ${visit.certification?.year || "........"}`, font: "Sarabun" }),
-            ],
-            alignment: AlignmentType.CENTER,
-          }),
+          ...(studentVisitData ? [
+            new Paragraph({ text: "รูปที่ 4 ภาพถ่ายนักเรียน (ขณะเยี่ยมบ้าน)", alignment: AlignmentType.CENTER }),
+            new Paragraph({
+              children: [
+                new ImageRun({
+                  data: base64ToUint8Array(studentVisitData),
+                  transformation: { width: 400, height: 250 },
+                } as any),
+              ],
+              alignment: AlignmentType.CENTER,
+            }),
+          ] : []),
         ],
       }],
     });
 
     Packer.toBlob(doc).then(blob => {
-      saveAs(blob, `Home_Visit_${student?.firstName}_${student?.lastName}.docx`);
+      saveAs(blob, `Home_Visit_${student?.prefix || ''}${student?.firstName}_${student?.lastName}.docx`);
     });
   };
 
@@ -2264,7 +2061,7 @@ export default function HomeVisitSystem() {
             >
               <option value="">-- เลือกนักเรียน --</option>
               {students.map(s => (
-                <option key={s.id} value={s.id}>{s.studentId} - {s.firstName} {s.lastName} ({s.classId})</option>
+                <option key={s.id} value={s.id}>{s.studentId} - {s.prefix || ''}{s.firstName} {s.lastName} ({s.classId})</option>
               ))}
             </select>
           </div>
@@ -2362,12 +2159,12 @@ export default function HomeVisitSystem() {
                       <User size={24} />
                     </div>
                     <div>
-                      <h4 className="font-bold text-slate-800">{student?.firstName} {student?.lastName}</h4>
+                      <h4 className="font-bold text-slate-800">{student?.prefix || ''}{student?.firstName} {student?.lastName}</h4>
                       <p className="text-xs text-slate-400">{student?.classId}</p>
                     </div>
                   </div>
                   <span className="text-[10px] font-bold text-slate-400 bg-white px-2 py-1 rounded-lg border border-slate-100">
-                    {format(toDate(v.date), 'dd MMM yyyy', { locale: th })}
+                    {v.date && !isNaN(new Date(v.date).getTime()) ? format(new Date(v.date), 'dd MMM yyyy', { locale: th }) : '-'}
                   </span>
                 </div>
                 
@@ -2409,32 +2206,6 @@ export default function HomeVisitSystem() {
           )}
         </div>
       </div>
-      
-      <AnimatePresence>
-        {notification && (
-          <motion.div
-            initial={{ opacity: 0, y: 50, scale: 0.9 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 20, scale: 0.9 }}
-            className={cn(
-              "fixed bottom-8 right-8 z-[100] px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 border",
-              notification.type === 'success' ? "bg-emerald-50 border-emerald-100 text-emerald-700" :
-              notification.type === 'error' ? "bg-red-50 border-red-100 text-red-700" :
-              "bg-blue-50 border-blue-100 text-blue-700"
-            )}
-          >
-            {notification.type === 'success' ? <Info size={20} /> : 
-             notification.type === 'error' ? <XCircle size={20} /> : <Info size={20} />}
-            <span className="font-medium">{notification.message}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
-  );
-}
-
-function XCircle({ size }: { size: number }) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
   );
 }

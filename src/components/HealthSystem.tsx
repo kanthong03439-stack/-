@@ -5,14 +5,22 @@ import { Student, UserProfile } from '../types';
 import { Scale, Save, Filter, TrendingUp, TrendingDown, Download, FileText, FileSpreadsheet } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '../lib/utils';
-import * as XLSX from 'xlsx';
-import jsPDF from 'jspdf';
+import toast from 'react-hot-toast';
+import { exportToExcel } from '../lib/excelExport';
+import { useAcademicYear } from '../contexts/AcademicYearContext';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { setupThaiFont } from '../lib/pdfFont';
+
+import { fetchStudentsForUser } from '../lib/firestoreUtils';
 
 export default function HealthSystem() {
+  const { selectedYear: academicYear, selectedTerm } = useAcademicYear();
   const [students, setStudents] = useState<Student[]>([]);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [selectedClass, setSelectedClass] = useState('ป.3/1');
+  const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
   const [healthData, setHealthData] = useState<Record<string, { weight: number; height: number }>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -22,7 +30,11 @@ export default function HealthSystem() {
   useEffect(() => {
     fetchUserProfile();
     fetchStudents();
-  }, [selectedClass]);
+  }, [selectedClass, academicYear]);
+
+  useEffect(() => {
+    fetchHealthData();
+  }, [selectedClass, selectedMonth, selectedYear, academicYear, selectedTerm]);
 
   const fetchUserProfile = async () => {
     const user = auth.currentUser;
@@ -38,17 +50,11 @@ export default function HealthSystem() {
   const fetchStudents = async () => {
     setLoading(true);
     try {
-      const q = query(collection(db, 'students'), where('classId', '==', selectedClass));
-      const querySnapshot = await getDocs(q);
-      const studentList = querySnapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as Student))
+      const studentList = await fetchStudentsForUser();
+      const filteredList = studentList
+        .filter(s => (s.yearClasses?.[academicYear] || s.classId) === selectedClass)
         .sort((a, b) => (a.studentNumber || 0) - (b.studentNumber || 0));
-      setStudents(studentList);
-      
-      const initialHealth: any = {};
-      studentList.forEach(s => {
-        initialHealth[s.id!] = { weight: s.weight || 0, height: s.height || 0 };
-      });
-      setHealthData(initialHealth);
+      setStudents(filteredList);
     } catch (error) {
       console.error("Error fetching students: ", error);
     } finally {
@@ -56,44 +62,101 @@ export default function HealthSystem() {
     }
   };
 
+  const fetchHealthData = async () => {
+    try {
+      const q = query(
+        collection(db, 'healthRecords'),
+        where('classId', '==', selectedClass),
+        where('month', '==', selectedMonth),
+        where('year', '==', selectedYear),
+        where('academicYear', '==', academicYear),
+        where('term', '==', selectedTerm)
+      );
+      const querySnapshot = await getDocs(q);
+      const data: any = {};
+      querySnapshot.docs.forEach(doc => {
+        const record = doc.data();
+        data[record.studentId] = { weight: record.weight, height: record.height };
+      });
+      setHealthData(data);
+    } catch (error) {
+      console.error("Error fetching health data: ", error);
+    }
+  };
+
   const handleHealthChange = (studentId: string, field: 'weight' | 'height', value: number) => {
     setHealthData(prev => ({
       ...prev,
-      [studentId]: { ...prev[studentId], [field]: value }
+      [studentId]: { ...prev[studentId] || { weight: 0, height: 0 }, [field]: value }
     }));
   };
 
   const saveHealthData = async () => {
     setSaving(true);
     try {
-      for (const studentId of Object.keys(healthData)) {
-        const { weight, height } = healthData[studentId];
-        await updateDoc(doc(db, 'students', studentId), {
+      for (const studentId of students.map(s => s.id)) {
+        const { weight, height } = healthData[studentId] || { weight: 0, height: 0 };
+        const recordId = `${selectedYear}_${selectedMonth}_${studentId}`;
+        
+        await setDoc(doc(db, 'healthRecords', recordId), {
+          studentId,
+          month: selectedMonth,
+          year: selectedYear,
           weight,
           height,
+          classId: selectedClass,
+          academicYear: academicYear,
+          term: selectedTerm,
+          teacherId: auth.currentUser?.uid,
           updatedAt: serverTimestamp()
         });
       }
-      alert('บันทึกข้อมูลสุขภาพเรียบร้อยแล้ว!');
+      toast.success('บันทึกข้อมูลแล้ว');
     } catch (error) {
       console.error("Error saving health data: ", error);
-      alert('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
+      toast.error('เกิดข้อผิดพลาดในการบันทึกข้อมูล');
     } finally {
       setSaving(false);
     }
   };
 
-  const generateReport = () => {
+  const generateReport = async () => {
     const teacherName = userProfile?.displayName || 'ไม่ระบุ';
+    
+    // Fetch data for the selected month/year
+    let records = [];
+    if (selectedMonth === 0) { // Assuming 0 means 'all'
+      const q = query(
+        collection(db, 'healthRecords'), 
+        where('classId', '==', selectedClass),
+        where('academicYear', '==', academicYear),
+        where('term', '==', selectedTerm)
+      );
+      const snapshot = await getDocs(q);
+      records = snapshot.docs.map(d => d.data());
+    } else {
+      const q = query(
+        collection(db, 'healthRecords'),
+        where('classId', '==', selectedClass),
+        where('month', '==', selectedMonth),
+        where('year', '==', selectedYear),
+        where('academicYear', '==', academicYear),
+        where('term', '==', selectedTerm)
+      );
+      const snapshot = await getDocs(q);
+      records = snapshot.docs.map(d => d.data());
+    }
+
     const reportData = students.map(s => {
-      const weight = healthData[s.id!]?.weight || 0;
-      const height = healthData[s.id!]?.height || 0;
+      const record = records.find((r: any) => r.studentId === s.id);
+      const weight = record?.weight || 0;
+      const height = record?.height || 0;
       const bmi = weight && height ? (weight / ((height / 100) ** 2)).toFixed(1) : '-';
       
       return {
         'เลขที่': s.studentNumber || '-',
         'รหัส': s.studentId,
-        'ชื่อ-นามสกุล': `${s.firstName} ${s.lastName}`,
+        'ชื่อ-นามสกุล': `${s.prefix || ''}${s.firstName} ${s.lastName}`,
         'น้ำหนัก (กก.)': weight || '-',
         'ส่วนสูง (ซม.)': height || '-',
         'BMI': bmi
@@ -101,49 +164,55 @@ export default function HealthSystem() {
     });
 
     if (reportFormat === 'excel') {
-      const ws = XLSX.utils.json_to_sheet(reportData);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Health");
-      
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`รายงานข้อมูลน้ำหนักและส่วนสูง ชั้น ${selectedClass}`],
-        [`วันที่: ${new Date().toLocaleDateString('th-TH')}`],
-        [],
-      ], { origin: "A1" });
+      const headers = ['เลขที่', 'รหัส', 'ชื่อ-นามสกุล', 'น้ำหนัก (กก.)', 'ส่วนสูง (ซม.)', 'BMI'];
+      const data = reportData.map(r => [
+        r['เลขที่'],
+        r['รหัส'],
+        r['ชื่อ-นามสกุล'],
+        r['น้ำหนัก (กก.)'],
+        r['ส่วนสูง (ซม.)'],
+        r['BMI']
+      ]);
 
-      const lastRow = reportData.length + 6;
-      XLSX.utils.sheet_add_aoa(ws, [
-        [`ลงชื่อ......................................................`],
-        [`( ${teacherName} )`],
-        [`ตำแหน่ง ครูประจำชั้น`]
-      ], { origin: `D${lastRow}` });
-
-      XLSX.writeFile(wb, `Health_Report_${selectedClass}.xlsx`);
+      await exportToExcel(
+        `รายงานข้อมูลน้ำหนักและส่วนสูง ชั้น ${selectedClass} ${selectedMonth !== 0 ? `เดือน ${['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'][selectedMonth - 1]} ${selectedYear + 543}` : 'ทั้งหมด'}`,
+        `วันที่: ${new Date().toLocaleDateString('th-TH')}`,
+        headers,
+        data,
+        `Health_Report_${selectedClass}_${selectedMonth !== 0 ? `${selectedMonth}_${selectedYear}` : 'All'}.xlsx`,
+        [
+          `ลงชื่อ......................................................`,
+          `( ${teacherName} )`,
+          `ตำแหน่ง ครูประจำชั้น`
+        ]
+      );
     } else {
       const doc = new jsPDF();
+      await setupThaiFont(doc);
+      
+      doc.setFont('Sarabun', 'bold');
       doc.setFontSize(16);
-      doc.text(`Health Report (Weight & Height) - Class ${selectedClass}`, 105, 15, { align: 'center' });
+      doc.text(`รายงานข้อมูลน้ำหนักและส่วนสูง ชั้น ${selectedClass} ${selectedMonth !== 0 ? `(${['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'][selectedMonth - 1]} ${selectedYear + 543})` : '(ทั้งหมด)'}`, 105, 15, { align: 'center' });
+      
+      doc.setFont('Sarabun', 'normal');
       doc.setFontSize(12);
-      doc.text(`Date: ${new Date().toLocaleDateString('th-TH')}`, 105, 25, { align: 'center' });
+      doc.text(`วันที่: ${new Date().toLocaleDateString('th-TH')}`, 105, 25, { align: 'center' });
 
       autoTable(doc, {
         startY: 35,
-        head: [['เลขที่', 'รหัส', 'ชื่อ-นามสกุล', 'น้ำหนัก', 'ส่วนสูง', 'BMI']],
-        body: students.map(s => {
-          const weight = healthData[s.id!]?.weight || 0;
-          const height = healthData[s.id!]?.height || 0;
-          const bmi = weight && height ? (weight / ((height / 100) ** 2)).toFixed(1) : '-';
-          return [
-            s.studentNumber || '-',
-            s.studentId,
-            `${s.firstName} ${s.lastName}`,
-            weight || '-',
-            height || '-',
-            bmi
-          ];
-        }),
+        head: [['เลขที่', 'รหัส', 'ชื่อ-นามสกุล', 'น้ำหนัก (กก.)', 'ส่วนสูง (ซม.)', 'BMI']],
+        body: reportData.map(r => [
+          r['เลขที่'],
+          r['รหัส'],
+          r['ชื่อ-นามสกุล'],
+          r['น้ำหนัก (กก.)'],
+          r['ส่วนสูง (ซม.)'],
+          r['BMI']
+        ]),
         theme: 'grid',
-        headStyles: { fillColor: [37, 99, 235] }
+        styles: { font: 'Sarabun', fontSize: 12 },
+        headStyles: { fillColor: [37, 99, 235], font: 'Sarabun', fontStyle: 'bold' },
+        bodyStyles: { font: 'Sarabun', fontStyle: 'normal' },
       });
 
       const finalY = (doc as any).lastAutoTable.finalY + 20;
@@ -152,7 +221,7 @@ export default function HealthSystem() {
       doc.text(`( ${teacherName} )`, rightX + 10, finalY + 10);
       doc.text(`ตำแหน่ง ครูประจำชั้น`, rightX + 12, finalY + 17);
 
-      doc.save(`Health_Report_${selectedClass}.pdf`);
+      doc.save(`Health_Report_${selectedClass}_${selectedMonth !== 0 ? `${selectedMonth}_${selectedYear}` : 'All'}.pdf`);
     }
     setIsReportModalOpen(false);
   };
@@ -169,6 +238,31 @@ export default function HealthSystem() {
           >
             {['ป.1/1', 'ป.2/1', 'ป.3/1', 'ป.4/1', 'ป.5/1', 'ป.6/1'].map(c => (
               <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-2 flex-1">
+          <label className="text-sm font-bold text-slate-700">เดือน</label>
+          <select 
+            value={selectedMonth}
+            onChange={(e) => setSelectedMonth(Number(e.target.value))}
+            className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium"
+          >
+            <option value={0}>ทั้งหมด</option>
+            {['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'].map((m, i) => (
+              <option key={i + 1} value={i + 1}>{m}</option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-2 flex-1">
+          <label className="text-sm font-bold text-slate-700">ปี</label>
+          <select 
+            value={selectedYear}
+            onChange={(e) => setSelectedYear(Number(e.target.value))}
+            className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium"
+          >
+            {[new Date().getFullYear(), new Date().getFullYear() - 1].map(y => (
+              <option key={y} value={y}>{y + 543}</option>
             ))}
           </select>
         </div>
@@ -217,7 +311,7 @@ export default function HealthSystem() {
                     <td className="px-6 py-4 text-sm font-medium text-slate-500">{student.studentNumber || '-'}</td>
                     <td className="px-6 py-4 text-sm font-medium text-slate-500">{student.studentId}</td>
                     <td className="px-6 py-4">
-                      <span className="text-sm font-bold text-slate-800">{student.firstName} {student.lastName}</span>
+                      <span className="text-sm font-bold text-slate-800">{student.prefix || ''}{student.firstName} {student.lastName}</span>
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex justify-center">

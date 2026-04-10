@@ -2,15 +2,16 @@ import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { createUserWithEmailAndPassword, updateProfile, signInWithEmailAndPassword } from 'firebase/auth';
-import { doc, setDoc, getDoc } from 'firebase/firestore';
+import { doc, setDoc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { motion } from 'framer-motion';
-import { UserPlus, Mail, Lock, User, School, ArrowLeft } from 'lucide-react';
+import { UserPlus, Mail, Lock, User, School, ArrowLeft, Hash } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 export default function Register() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
+  const [studentId, setStudentId] = useState('');
   const [role, setRole] = useState<'teacher' | 'student'>('teacher');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -25,65 +26,77 @@ export default function Register() {
     setLoading(true);
 
     try {
+      let finalEmail = email;
+      
+      let displayNameToUse = displayName;
+      
+      // Student Validation against Master Data
+      if (role === 'student') {
+        if (!studentId) {
+          setError('⚠️ กรุณากรอกเลขประจำตัวนักเรียน');
+          setLoading(false);
+          return;
+        }
+
+        if (!/^\d{4}$/.test(studentId)) {
+          setError('⚠️ เลขประจำตัวนักเรียนต้องเป็นตัวเลข 4 หลัก');
+          setLoading(false);
+          return;
+        }
+
+        const masterQuery = query(
+          collection(db, 'students'),
+          where('studentId', '==', studentId)
+        );
+        const masterSnap = await getDocs(masterQuery);
+
+        if (masterSnap.empty) {
+          setError('⚠️ ไม่พบข้อมูลนักเรียนในฐานข้อมูล กรุณาตรวจสอบเลขประจำตัวอีกครั้ง');
+          setLoading(false);
+          return;
+        }
+
+        const studentData = masterSnap.docs[0].data();
+        displayNameToUse = `${studentData.prefix || ''}${studentData.firstName} ${studentData.lastName}`;
+
+        // Generate dummy email for student
+        finalEmail = `${studentId}@student.school`;
+        
+        // Use auto-linked name
+        setDisplayName(displayNameToUse);
+      }
+
       let userCredential;
       try {
-        userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        userCredential = await createUserWithEmailAndPassword(auth, finalEmail, password);
       } catch (err: any) {
         if (err.code === 'auth/email-already-in-use') {
-          // If email exists, try to sign in to see if it's a deleted user returning
-          try {
-            userCredential = await signInWithEmailAndPassword(auth, email, password);
-            const userDoc = await getDoc(doc(db, 'users', userCredential.user.uid));
-            
-            if (!userDoc.exists()) {
-              // User exists in Auth but not in Firestore (deleted by admin)
-              // We can "re-register" them now
-              await setDoc(doc(db, 'users', userCredential.user.uid), {
-                uid: userCredential.user.uid,
-                email,
-                displayName,
-                role: 'teacher',
-                isApproved: false,
-                createdAt: new Date().toISOString(),
-                reRegisteredAt: new Date().toISOString()
-              });
-              setSuccess('พบข้อมูลเดิมของคุณในระบบ ระบบได้ทำการกู้คืนโปรไฟล์และส่งคำขออนุมัติใหม่เรียบร้อยแล้ว กรุณารอการตรวจสอบจากผู้ดูแลระบบ');
-              setTimeout(() => navigate('/login'), 4000);
-              return;
-            } else {
-              setError('⚠️ อีเมลนี้ถูกใช้งานแล้วในระบบและยังมีบัญชีที่ใช้งานได้อยู่ กรุณาเข้าสู่ระบบด้วยบัญชีเดิม');
-              await auth.signOut();
-              setLoading(false);
-              return;
-            }
-          } catch (signInErr: any) {
-            // If sign in fails, it's either a wrong password or a real conflict
-            setError('⚠️ อีเมลนี้ถูกใช้งานแล้วในระบบ หากคุณต้องการลงทะเบียนใหม่ด้วยอีเมลเดิม กรุณาใช้รหัสผ่านเดิมที่เคยลงทะเบียนไว้');
-            setLoading(false);
-            return;
-          }
+          setError(role === 'student' ? '⚠️ เลขประจำตัวนี้ถูกลงทะเบียนแล้ว' : '⚠️ อีเมลนี้มีอยู่ในระบบแล้ว ไม่สามารถลงทะเบียนซ้ำได้');
+          setLoading(false);
+          return;
         }
         throw err;
       }
 
-      await updateProfile(userCredential.user, { displayName });
+      await updateProfile(userCredential.user, { displayName: displayNameToUse });
 
-      const isAdminEmail = email === 'kanthong.03439@gmail.com' || email === 'kanthong.8426@gmail.com';
+      const isAdminEmail = finalEmail === 'kanthong.03439@gmail.com' || finalEmail === 'kanthong.8426@gmail.com';
 
       // Create user profile in Firestore
       await setDoc(doc(db, 'users', userCredential.user.uid), {
         uid: userCredential.user.uid,
-        email,
-        displayName,
+        email: finalEmail,
+        displayName: displayNameToUse,
         role: isAdminEmail ? 'admin' : role,
-        isApproved: isAdminEmail, // Auto-approve admin
+        studentId: role === 'student' ? studentId : null,
+        isApproved: isAdminEmail, // Only auto-approve admins. Students and Teachers need approval.
         createdAt: new Date().toISOString()
       });
 
       if (isAdminEmail) {
         setSuccess('ลงทะเบียนผู้ดูแลระบบสำเร็จ! คุณสามารถเข้าใช้งานได้ทันที');
       } else {
-        setSuccess('ลงทะเบียนสำเร็จ! กรุณารอการอนุมัติจากผู้ดูแลระบบก่อนเข้าใช้งาน');
+        setSuccess('ลงทะเบียนสำเร็จ! กรุณารอการอนุมัติจากผู้ดูแลระบบก่อนเข้าสู่ระบบ');
       }
       
       // Delay navigation to show success message
@@ -91,11 +104,11 @@ export default function Register() {
     } catch (err: any) {
       console.error("Registration Error:", err);
       if (err.code === 'auth/email-already-in-use') {
-        setError('⚠️ อีเมลนี้มีอยู่ในระบบแล้ว หากคุณเคยถูกลบข้อมูล กรุณาไปที่หน้าเข้าสู่ระบบเพื่อขอกลับมาใช้งานใหม่ด้วยรหัสผ่านเดิม');
+        setError(role === 'student' ? '⚠️ เลขประจำตัวนี้ถูกลงทะเบียนแล้ว' : '⚠️ อีเมลนี้มีอยู่ในระบบแล้ว');
       } else if (err.code === 'auth/weak-password') {
         setError('⚠️ รหัสผ่านต้องมีความยาวอย่างน้อย 6 ตัวอักษร');
       } else if (err.code === 'auth/invalid-email') {
-        setError('⚠️ รูปแบบอีเมลไม่ถูกต้อง');
+        setError('⚠️ รูปแบบข้อมูลไม่ถูกต้อง');
       } else {
         setError(err.message || 'เกิดข้อผิดพลาดในการลงทะเบียน');
       }
@@ -105,11 +118,25 @@ export default function Register() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-500 to-indigo-700 flex items-center justify-center p-4">
+    <div className="min-h-screen relative flex items-center justify-center p-4 overflow-hidden">
+      {/* Background Image with Blur */}
+      <img 
+        src="https://img1.pic.in.th/images/-1b9f5f48995a38121.jpg"
+        alt="School Background"
+        className="absolute inset-0 z-0 w-full h-full object-cover"
+        style={{
+          filter: 'blur(5px)',
+          transform: 'scale(1.1)' // Prevent white edges from blur
+        }}
+        referrerPolicy="no-referrer"
+      />
+      {/* Overlay to ensure readability */}
+      <div className="absolute inset-0 z-0 bg-blue-900/50" />
+
       <motion.div 
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
-        className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden"
+        className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden relative z-10"
       >
         <div className="p-6 text-center bg-slate-50 border-b border-slate-100 relative">
           <Link to="/login" className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-blue-600 transition-all">
@@ -132,37 +159,87 @@ export default function Register() {
           )}
 
           <div className="space-y-1.5">
-            <label className="text-sm font-semibold text-slate-700">ชื่อ-นามสกุล</label>
-            <div className="relative">
-              <User className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-              <input 
-                type="text"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                placeholder="ชื่อ-นามสกุล"
-                required
-              />
+            <label className="text-sm font-semibold text-slate-700">บทบาทการใช้งาน</label>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => { setRole('teacher'); setDisplayName(''); }}
+                className={cn(
+                  "py-2.5 rounded-xl border-2 transition-all font-medium",
+                  role === 'teacher' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 text-slate-500"
+                )}
+              >
+                ครูผู้สอน
+              </button>
+              <button
+                type="button"
+                onClick={() => { setRole('student'); setDisplayName(''); }}
+                className={cn(
+                  "py-2.5 rounded-xl border-2 transition-all font-medium",
+                  role === 'student' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 text-slate-500"
+                )}
+              >
+                นักเรียน
+              </button>
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="text-sm font-semibold text-slate-700">อีเมล</label>
-            <div className="relative">
-              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-              <input 
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                placeholder="example@email.com"
-                required
-              />
+          {role === 'teacher' && (
+            <div className="space-y-1.5">
+              <label className="text-sm font-semibold text-slate-700">ชื่อ-นามสกุล</label>
+              <div className="relative">
+                <User className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                <input 
+                  type="text"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  placeholder="ชื่อ-นามสกุล"
+                  required
+                />
+              </div>
             </div>
-          </div>
+          )}
+
+          {role === 'student' ? (
+            <motion.div 
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              className="space-y-1.5"
+            >
+              <label className="text-sm font-semibold text-slate-700">เลขประจำตัวนักเรียน</label>
+              <div className="relative">
+                <Hash className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                <input 
+                  type="text"
+                  value={studentId}
+                  onChange={(e) => setStudentId(e.target.value)}
+                  className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  placeholder="เลขประจำตัว 4 หลัก"
+                  maxLength={4}
+                  required
+                />
+              </div>
+            </motion.div>
+          ) : (
+            <div className="space-y-1.5">
+              <label className="text-sm font-semibold text-slate-700">อีเมล</label>
+              <div className="relative">
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                <input 
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  placeholder="example@email.com"
+                  required
+                />
+              </div>
+            </div>
+          )}
 
           <div className="space-y-1.5">
-            <label className="text-sm font-semibold text-slate-700">รหัสผ่าน</label>
+            <label className="text-sm font-semibold text-slate-700">กำหนดรหัสผ่าน</label>
             <div className="relative">
               <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
               <input 
@@ -173,32 +250,6 @@ export default function Register() {
                 placeholder="••••••••"
                 required
               />
-            </div>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="text-sm font-semibold text-slate-700">บทบาท</label>
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => setRole('teacher')}
-                className={cn(
-                  "py-2.5 rounded-xl border-2 transition-all font-medium",
-                  role === 'teacher' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 text-slate-500"
-                )}
-              >
-                ครูผู้สอน
-              </button>
-              <button
-                type="button"
-                onClick={() => setRole('student')}
-                className={cn(
-                  "py-2.5 rounded-xl border-2 transition-all font-medium",
-                  role === 'student' ? "border-blue-600 bg-blue-50 text-blue-600" : "border-slate-100 text-slate-500"
-                )}
-              >
-                นักเรียน
-              </button>
             </div>
           </div>
 
@@ -217,7 +268,7 @@ export default function Register() {
 
           <div className="text-center pt-2">
             <div className="text-[10px] text-slate-400 uppercase tracking-widest">
-              Developed by KruKan
+              &copy; Copyright {new Date().getFullYear() > 2026 ? `2026 - ${new Date().getFullYear()}` : '2026'} Developed by KruKan
             </div>
           </div>
         </form>
